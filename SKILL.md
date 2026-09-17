@@ -12,6 +12,13 @@ For first-time project configuration, follow [SETUP.md](SETUP.md).
 The current conversation's agent is the controller by default; do not start a
 separate controller agent. Its model is selected in the user's session.
 
+When the user explicitly selects Shawshank to execute a plan produced elsewhere,
+use Shawshank's implementation, review and recovery flow instead of execution
+routing embedded in that plan. Preserve approved requirements, constraints and
+acceptance checks; do not rewrite the plan or broaden authority. Do not run a
+second execution workflow alongside it. If execution has already started under
+another workflow, reconcile existing work and live workers before dispatching.
+
 The controller dispatches, observes, validates, triages and reports; it does not
 implement or repair task code. Claude and Codex can orchestrate.
 Workers are configurable external Herdr agents

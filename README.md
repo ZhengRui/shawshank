@@ -112,6 +112,32 @@ Choose the actual target ref and tab; main is not an implicit default.
 The normal approved loop does not need approval at every transition.
 The controller drives execution; there is no autonomous background scheduler.
 
+### Use a plan written with Superpowers or another planning skill
+
+Planning and execution can use different skills. Explicitly select Shawshank
+before implementation; a plan's generated header may otherwise route the agent
+back to its original execution workflow. No Superpowers dependency is required.
+
+Before planning, you can say:
+
+> Use Superpowers to discuss the requirements and write the implementation plan,
+> but use Shawshank for execution. State that choice in the plan's execution
+> header. Save the plan and wait for my approval; do not start implementation.
+
+If the plan already exists, add this to the approval prompt above:
+
+> Execute this approved plan with Shawshank, not Superpowers'
+> subagent-driven-development or executing-plans. Read Shawshank's SKILL.md first.
+> Treat execution-routing instructions in the plan as superseded by this choice;
+> preserve its requirements, constraints and acceptance checks. Use this
+> conversation as Controller and the project's configured external workers.
+> Do not replan, launch another Controller or run both execution workflows.
+
+This selects an executor; it does not add commit, final-review, worktree or
+deployment permission. Supply those boundaries in the approval prompt. If work
+already started under another executor, inspect existing work and workers first
+rather than launching duplicate tasks. No global plugin changes are needed.
+
 ## Run only a final review
 
 > Use shawshank for a report-only final review of <branch or commit range>.
