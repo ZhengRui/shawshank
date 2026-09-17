@@ -39,6 +39,8 @@ Final-run takeover/replacement is not supported.
 
 Before dispatch, establish the approved scope, repository, local commit authority
 and allowed Herdr parent pane/tab. Inspect Git state and preserve unrelated work.
+For a dedicated feature tab, follow [feature-tab.md](references/feature-tab.md)
+to create it when authorized and reuse its assigned shell without an empty split.
 Read installed Herdr CLI help and verify HERDR_ENV=1 plus the actual session and
 explicit targets; never infer them from focus. If inherited context is missing,
 stop and arrange a verified launcher; see recovery's launcher-context section.

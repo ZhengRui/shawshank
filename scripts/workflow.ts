@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { herdr, HerdrError, type HerdrCall } from './herdr';
 import { provenanceInstructions, validateProvenance, retainedRole } from './commit-provenance';
+import { allocatePane, prepareShell, returnToShell, shellPane } from './feature-pane';
 
 function git(cwd: string, ...args: string[]): string {
   const result = Bun.spawnSync(['git', '-C', cwd, ...args]);
@@ -890,7 +891,7 @@ export async function replaceWorker(runPath: string, controller: string, decisio
       if (decision.no_pane_created !== true) throw new Error('Missing pane receipt: establish that no pane was created');
       required(decision.no_pane_evidence, 'positive no-launch evidence');
     } else if (previous.cleanup_state !== 'closed') {
-      if (previous.pane_id === config.parentPane) throw new Error('Cannot replace the parent pane');
+      if (previous.pane_id === config.parentPane && !config.reusePane) throw new Error('Cannot replace the parent pane');
       let absent = false;
       try {
         const observed = (await call('pane', 'get', previous.pane_id)).pane;
@@ -899,28 +900,37 @@ export async function replaceWorker(runPath: string, controller: string, decisio
         if (error instanceof HerdrError && error.code === 'pane_not_found') absent = true;
         else throw error;
       }
-      if (!absent) ready(await recoveryAgent(run, previous, call), previous, config.tab);
+      if (!absent) {
+        const observed = (await call('pane', 'get', previous.pane_id)).pane;
+        if (config.reusePane && previous.pane_id === config.parentPane && !observed?.agent)
+          await shellPane(call, previous.pane_id, config.tab);
+        else ready(await recoveryAgent(run, previous, call), previous, config.tab);
+      }
       db.transaction(() => {
         owned(db, run.id, controller, run.stage,true);
         if (recoverySnapshot(db, run) !== before) throw new Error('Run changed during replacement');
         recoveryInput(decisionFile, run);
-        db.query("UPDATE attempts SET cleanup_state='closing' WHERE run_id=? AND pane_id=?").run(run.id, previous.pane_id);
+        db.query("UPDATE attempts SET cleanup_state='closing' WHERE run_id=? AND pane_id=? AND COALESCE(cleanup_state,'')!='closed'").run(run.id, previous.pane_id);
       }).immediate();
       claimed = true;
       if (!absent) {
-        const result = await call('pane', 'close', previous.pane_id);
-        if (result.type !== 'ok') throw new Error('Unconfirmed replacement close');
-        try { await call('pane','get',previous.pane_id); }
-        catch (error) {
-          if (error instanceof HerdrError && error.code === 'pane_not_found') absent = true;
-          else throw error;
+        if (config.reusePane && previous.pane_id === config.parentPane) {
+          await returnToShell(call, previous, config);
+        } else {
+          const result = await call('pane', 'close', previous.pane_id);
+          if (result.type !== 'ok') throw new Error('Unconfirmed replacement close');
+          try { await call('pane','get',previous.pane_id); }
+          catch (error) {
+            if (error instanceof HerdrError && error.code === 'pane_not_found') absent = true;
+            else throw error;
+          }
+          if (!absent) throw new Error('Old pane is still present; no replacement started');
         }
-        if (!absent) throw new Error('Old pane is still present; no replacement started');
       }
       db.transaction(() => {
         const current = db.query('SELECT * FROM runs WHERE id=?').get(run.id) as any;
         if (current.controller_id !== controller || current.stage !== run.stage) throw new Error('Replacement ownership changed');
-        db.query("UPDATE attempts SET cleanup_state='closed',cleanup_error=NULL WHERE run_id=? AND pane_id=?").run(run.id, previous.pane_id);
+        db.query("UPDATE attempts SET cleanup_state='closed',cleanup_error=NULL WHERE run_id=? AND pane_id=? AND COALESCE(cleanup_state,'')!='closed'").run(run.id, previous.pane_id);
       }).immediate();
       claimed = false;
     }
@@ -964,8 +974,8 @@ export async function replaceWorker(runPath: string, controller: string, decisio
     const attempt = {id,worker_name:name,worker_kind:worker.kind,pane_id:null as string|null};
     // Intent is durable before any new external operation. A lost receipt stays
     // prepared/prompting for explicit reconciliation, never automatic replay.
-    const pane = (await call('pane','split','--pane',config.parentPane,'--direction','right','--cwd',run.worktree_path,'--no-focus')).pane;
-    if (!pane?.pane_id || pane.tab_id !== config.tab || pane.pane_id === config.parentPane || pane.pane_id === previous.pane_id)
+    const pane = await allocatePane(call, config, run.worktree_path, 'right');
+    if (!pane?.pane_id || pane.tab_id !== config.tab || (!config.reusePane && (pane.pane_id === config.parentPane || pane.pane_id === previous.pane_id)))
       throw new Error('Unexpected replacement pane');
     db.transaction(() => { owned(db,run.id,controller,stage); db.query('UPDATE attempts SET pane_id=? WHERE id=?').run(pane.pane_id,id); }).immediate();
     attempt.pane_id = pane.pane_id;
@@ -999,7 +1009,7 @@ function cleanupTargets(db: Database, run: any) {
   for (const a of attempts) {
     if (['task_passed', 'final_passed'].includes(run.stage) || (run.kind === 'final_review' && ['final_review', 'verification'].includes(a.action) && a.status === 'accepted') ||
       a.cleanup_state === 'pending' || a.cleanup_state === 'closing') {
-      if (!panes.has(a.pane_id)) panes.set(a.pane_id, a);
+      if (!panes.has(a.pane_id) || a.cleanup_state !== 'closed') panes.set(a.pane_id, a);
     }
   }
   return [...panes.values()];
@@ -1019,14 +1029,14 @@ async function closeWorker(db: Database, run: any, controller: string, attempt: 
   try {
     db.transaction(() => {
       owned(db, run.id, controller, run.stage);
-      const group = db.query('SELECT * FROM attempts WHERE run_id=? AND pane_id=?').all(run.id, pane) as any[];
-      if (group.every(a => a.cleanup_state === 'closed')) return;
+      const group = db.query("SELECT * FROM attempts WHERE run_id=? AND pane_id=? AND COALESCE(cleanup_state,'')!='closed'").all(run.id, pane) as any[];
+      if (!group.length) return;
       const config = JSON.parse(run.config_json);
-      if (!pane || pane === config.parentPane || group.some(a => a.status !== 'accepted' ||
+      if (!pane || (pane === config.parentPane && !config.reusePane) || pane === config.controllerPane || group.some(a => a.status !== 'accepted' ||
         a.worker_name !== attempt.worker_name || a.worker_kind !== attempt.worker_kind))
         throw new Error('Pane ownership or accepted delivery is not confirmed');
       cleanHead(run);
-      db.query("UPDATE attempts SET cleanup_state='closing',cleanup_error=NULL WHERE run_id=? AND pane_id=?").run(run.id, pane);
+      db.query("UPDATE attempts SET cleanup_state='closing',cleanup_error=NULL WHERE run_id=? AND pane_id=? AND COALESCE(cleanup_state,'')!='closed'").run(run.id, pane);
       claimed = true;
     }).immediate();
     if (!claimed) return;
@@ -1040,31 +1050,40 @@ async function closeWorker(db: Database, run: any, controller: string, attempt: 
       else throw error;
     }
     if (!absent) {
-      const agent = (await call('agent', 'get', attempt.worker_name)).agent;
-      ready(agent, attempt, JSON.parse(run.config_json).tab);
-      if (realpathSync(required(agent.cwd, 'worker cwd')) !== run.worktree_path ||
-        realpathSync(required(agent.foreground_cwd, 'worker foreground cwd')) !== run.worktree_path)
-        throw new Error('Worker directory changed; preserve it');
-      // This is a checked CLI operation, not a server-side compare-and-close.
-      // Other actors must not concurrently repurpose this owned pane.
-      cleanHead(run);
-      const result = await call('pane', 'close', pane);
-      if (result.type !== 'ok') throw new Error('Unconfirmed pane close response');
-      try {
-        await call('pane', 'get', pane);
-      } catch (error) {
-        if (error instanceof HerdrError && error.code === 'pane_not_found') absent = true;
-        else throw error;
+      const saved = JSON.parse(run.config_json);
+      const reusable = saved.reusePane && pane === saved.parentPane;
+      const alreadyShell = reusable && !(await call('pane', 'get', pane)).pane?.agent;
+      if (!alreadyShell) {
+        const agent = (await call('agent', 'get', attempt.worker_name)).agent;
+        ready(agent, attempt, saved.tab);
+        if (realpathSync(required(agent.cwd, 'worker cwd')) !== run.worktree_path ||
+          realpathSync(required(agent.foreground_cwd, 'worker foreground cwd')) !== run.worktree_path)
+          throw new Error('Worker directory changed; preserve it');
       }
-      if (!absent) throw new Error('Pane is still present after close');
+      // Checked CLI operations, not server-side compare-and-close. Other actors
+      // must not concurrently repurpose this owned pane.
+      cleanHead(run);
+      if (reusable) {
+        await returnToShell(call, attempt, saved);
+      } else {
+        const result = await call('pane', 'close', pane);
+        if (result.type !== 'ok') throw new Error('Unconfirmed pane close response');
+        try {
+          await call('pane', 'get', pane);
+        } catch (error) {
+          if (error instanceof HerdrError && error.code === 'pane_not_found') absent = true;
+          else throw error;
+        }
+        if (!absent) throw new Error('Pane is still present after close');
+      }
     }
     db.transaction(() => {
       const current = db.query('SELECT * FROM runs WHERE id=?').get(run.id) as any;
       if (current.controller_id !== controller || current.stage !== run.stage) throw new Error('Cleanup ownership changed');
-      db.query("UPDATE attempts SET cleanup_state='closed',cleanup_error=NULL WHERE run_id=? AND pane_id=?").run(run.id, pane);
+      db.query("UPDATE attempts SET cleanup_state='closed',cleanup_error=NULL WHERE run_id=? AND pane_id=? AND COALESCE(cleanup_state,'')!='closed'").run(run.id, pane);
     }).immediate();
   } catch (error) {
-    if (claimed) db.query("UPDATE attempts SET cleanup_state='pending',cleanup_error=? WHERE run_id=? AND pane_id=? AND EXISTS (SELECT 1 FROM runs WHERE id=? AND controller_id=?)")
+    if (claimed) db.query("UPDATE attempts SET cleanup_state='pending',cleanup_error=? WHERE run_id=? AND pane_id=? AND COALESCE(cleanup_state,'')!='closed' AND EXISTS (SELECT 1 FROM runs WHERE id=? AND controller_id=?)")
       .run(String(error), run.id, pane,run.id,controller);
     throw error;
   }
@@ -1083,7 +1102,7 @@ export async function cleanupWorkers(runPath: string, controller: string, call: 
         // before the close claim (dirty files or unaccepted worker output).
         const current = db.query('SELECT cleanup_state FROM attempts WHERE id=?').get(attempt.id) as any;
         if (current.cleanup_state !== 'closing' && current.cleanup_state !== 'closed')
-          db.query("UPDATE attempts SET cleanup_state='pending',cleanup_error=? WHERE run_id=? AND pane_id=? AND EXISTS (SELECT 1 FROM runs WHERE id=? AND controller_id=?)")
+          db.query("UPDATE attempts SET cleanup_state='pending',cleanup_error=? WHERE run_id=? AND pane_id=? AND COALESCE(cleanup_state,'')!='closed' AND EXISTS (SELECT 1 FROM runs WHERE id=? AND controller_id=?)")
             .run(String(error), run.id, attempt.pane_id,run.id,controller);
       }
     }
@@ -1423,8 +1442,8 @@ export async function completeFinalReview(runPath: string, controller: string, e
 }
 
 export async function dispatchFinalReview(runPath: string, controller: string,
-  parentPane: string, tab: string, call: HerdrCall = herdr) {
-  return dispatchFinalAttempt(runPath, controller, 'final_review', parentPane, tab, call);
+  parentPane: string, tab: string, call: HerdrCall = herdr, reusePane = false) {
+  return dispatchFinalAttempt(runPath, controller, 'final_review', parentPane, tab, call, reusePane);
 }
 
 export async function dispatchFinalWork(runPath: string, controller: string,
@@ -1436,13 +1455,18 @@ export async function dispatchFinalWork(runPath: string, controller: string,
 }
 
 async function dispatchFinalAttempt(runPath: string, controller: string,
-  action: 'final_review' | 'repair' | 'verification', parentPane: string, tab: string, call: HerdrCall) {
+  action: 'final_review' | 'repair' | 'verification', parentPane: string, tab: string, call: HerdrCall, reusePane = false) {
   const { path, db, run } = openRun(runPath, 'final_review');
   call = guardedTransport(db, run.id, controller, call);
   let claimed = false;
   try {
     const config = JSON.parse(run.config_json);
     const initial = action === 'final_review';
+    if (initial && run.stage === 'final_ready' && reusePane) {
+      config.reusePane = true;
+      config.controllerPane = required(process.env.HERDR_PANE_ID, 'verified controller pane');
+      await prepareShell(call, parentPane, tab, run.worktree_path, config.controllerPane);
+    }
     const repair = action === 'repair';
     const from = initial ? 'final_ready' : repair ? 'final_repair_ready' : 'final_verification_ready';
     const dispatching = initial ? 'final_dispatching' : repair ? 'final_repair_dispatching' : 'final_verification_dispatching';
@@ -1513,9 +1537,9 @@ async function dispatchFinalAttempt(runPath: string, controller: string,
         `Use findings: [] if no issues exist. This is report-only delivery, not authorization to repair.\n` :
         finalWorkPrompt(db, run, attempt, action, input, decision), { flag: 'wx' });
       if (!retained) {
-      const pane = (await call('pane', 'split', '--pane', parentPane, '--direction', 'down', '--cwd', run.worktree_path, '--no-focus')).pane;
-      if (!pane?.pane_id || pane.tab_id !== tab || pane.pane_id === parentPane ||
-        db.query('SELECT id FROM attempts WHERE run_id=? AND pane_id=?').get(run.id, pane.pane_id)) throw new Error('Independent reviewer pane required');
+      const pane = await allocatePane(call, { ...config, parentPane, tab }, run.worktree_path, 'down');
+      if (!pane?.pane_id || pane.tab_id !== tab || (pane.pane_id === parentPane && !config.reusePane) ||
+        db.query("SELECT id FROM attempts WHERE run_id=? AND pane_id=? AND COALESCE(cleanup_state,'')!='closed'").get(run.id, pane.pane_id)) throw new Error('Independent reviewer pane required');
       attempt.pane_id = pane.pane_id;
       saveAttempt(db, run, controller, dispatching, 'UPDATE attempts SET pane_id=? WHERE id=?', pane.pane_id, id);
       try {
@@ -1569,9 +1593,17 @@ export async function acceptFinalReview(runPath: string, controller: string, cal
       required(attempt.worker_kind, 'saved worker kind');
       const config = JSON.parse(run.config_json);
       required(config.tab, 'saved worker tab'); required(config.parentPane, 'saved parent pane');
-      if (attempt.pane_id === config.parentPane) throw new Error('Reviewer cannot own the parent pane');
+      const reusable = config.reusePane && attempt.pane_id === config.parentPane;
+      if (attempt.pane_id === config.parentPane && !reusable) throw new Error('Reviewer cannot own the parent pane');
+      if (reusable && (attempt.pane_id === config.controllerPane || attempt.pane_id === process.env.HERDR_PANE_ID))
+        throw new Error('Cannot recover from the controller pane');
       validateRecovery();
       for (const [kind, target, absent] of [['agent', attempt.worker_name, 'agent_not_found'], ['pane', attempt.pane_id, 'pane_not_found']]) {
+        if (kind === 'pane' && reusable) {
+          const observed = await shellPane(call, target, config.tab);
+          if (realpathSync(observed.shell.cwd) !== run.worktree_path) throw new Error('Recovery shell directory differs');
+          continue;
+        }
         try { await call(kind, 'get', target); }
         catch (error) {
           if (error instanceof HerdrError && error.code === absent) continue;
@@ -1895,9 +1927,8 @@ export async function dispatchRepair(runPath: string, controller: string, call: 
         checks: task.acceptance.map((requirement: string) => ({ requirement, status: 'PASS',
           evidence: { command: '<executed command>', result: '<observed result>' } })) }, null, 2) + '\n', { flag: 'wx' });
     if (escalate) {
-      const pane = (await call('pane', 'split', '--pane', config.parentPane, '--direction', 'right',
-        '--cwd', run.worktree_path, '--no-focus')).pane;
-      if (!pane?.pane_id || pane.tab_id !== config.tab || pane.pane_id === previous.pane_id)
+      const pane = await allocatePane(call, config, run.worktree_path, 'right');
+      if (!pane?.pane_id || pane.tab_id !== config.tab || (!config.reusePane && pane.pane_id === previous.pane_id))
         throw new Error('Unexpected escalation pane identity');
       paneId = pane.pane_id;
       saveAttempt(db,run,controller,'repair_dispatching','UPDATE attempts SET pane_id=? WHERE id=?',paneId,id);
@@ -2043,7 +2074,7 @@ export async function correctReport(runPath: string, controller: string, action:
 }
 
 export async function dispatchImplementation(runPath: string, controller: string,
-  parentPane: string, tab: string, call: HerdrCall = herdr, startupDecision?: string) {
+  parentPane: string, tab: string, call: HerdrCall = herdr, startupDecision?: string, reusePane = false) {
   const { path, db, run } = openRun(runPath);
   call = guardedTransport(db,run.id,controller,call);
   let attempted = false;
@@ -2092,6 +2123,8 @@ export async function dispatchImplementation(runPath: string, controller: string
     if (dirty(run.worktree_path) || git(run.worktree_path, 'rev-parse', 'HEAD') !== run.base_sha)
       throw new Error('Worktree changed since registration');
     const config = projectConfig(run.worktree_path);
+    const placement = reusePane ? { reusePane: true, controllerPane: required(process.env.HERDR_PANE_ID, 'verified controller pane') } : {};
+    if (reusePane) await prepareShell(call, parentPane, tab, run.worktree_path, placement.controllerPane!);
     const worker = config.roles?.implementer?.[run.tier]?.[0];
     if (!worker || !['codex', 'opencode', 'claude'].includes(worker.kind))
       throw new Error('Explicit codex/opencode/claude implementer configuration required');
@@ -2114,7 +2147,7 @@ export async function dispatchImplementation(runPath: string, controller: string
         dispatch_path,report_path,base_sha,started_at) VALUES (?,?,'implementation','prepared',?,?,?,?,?,?,?)`)
         .run(id, run.id, worker.kind, worker.model, name, dispatch, report, run.base_sha, now);
       db.query('UPDATE runs SET stage=?,config_json=?,updated_at=? WHERE id=?')
-        .run('dispatching', JSON.stringify({ worker: roleSnapshot(worker), trailer, parentPane, tab,
+        .run('dispatching', JSON.stringify({ ...placement, worker: roleSnapshot(worker), trailer, parentPane, tab,
           commitProvenance: config.project?.commitProvenance === true,
           reviewer: roleSnapshot(config.roles?.taskReviewer), implementerTiers: tierSnapshot(config) }), now, run.id);
     }).immediate();
@@ -2130,8 +2163,7 @@ export async function dispatchImplementation(runPath: string, controller: string
         status: 'DONE', checks: task.acceptance.map((requirement: string) =>
           ({ requirement, status: 'PASS', evidence: { command: '<executed command>', result: '<observed result>' } })), concerns: [] }, null, 2) +
       '\nUse DONE_WITH_CONCERNS when applicable. Never report PASS for a check not run. Leave a clean worktree.\n', { flag: 'wx' });
-    const pane = (await call('pane', 'split', '--pane', parentPane, '--direction', 'right',
-      '--cwd', run.worktree_path, '--no-focus')).pane;
+    const pane = await allocatePane(call, { ...placement, parentPane, tab }, run.worktree_path, 'right');
     if (!pane?.pane_id || pane.tab_id !== tab) throw new Error('Unexpected created pane identity');
     saveAttempt(db,run,controller,'dispatching','UPDATE attempts SET pane_id=? WHERE id=?',pane.pane_id,id);
     let started;
@@ -2240,8 +2272,9 @@ if (import.meta.main) {
       console.log(JSON.stringify(registerTask(path, controller), null, 2));
     else if (command === 'register-final-review' && path === '--input' && flag && controller === '--controller' && extra.length === 1)
       console.log(JSON.stringify(registerFinalReview(flag, extra[0]), null, 2));
-    else if (command === 'dispatch-final-review' && path && flag === '--controller' && controller && extra.length === 4 && extra[0] === '--pane' && extra[2] === '--tab')
-      console.log(JSON.stringify(await dispatchFinalReview(path, controller, extra[1], extra[3]), null, 2));
+    else if (command === 'dispatch-final-review' && path && flag === '--controller' && controller &&
+      (extra.length === 4 || (extra.length === 5 && extra[4] === '--reuse-pane')) && extra[0] === '--pane' && extra[2] === '--tab')
+      console.log(JSON.stringify(await dispatchFinalReview(path, controller, extra[1], extra[3], herdr, extra[4] === '--reuse-pane'), null, 2));
     else if (command === 'dispatch-final-review' && path && flag === '--controller' && controller && extra.length === 2 && extra[0] === '--correct-report')
       console.log(JSON.stringify(await correctReport(path, controller, 'final_review', extra[1]), null, 2));
     else if (command === 'accept-final-review' && path && flag === '--controller' && controller &&
@@ -2263,8 +2296,8 @@ if (import.meta.main) {
       console.log(JSON.stringify(await correctReport(path, controller,
         command === 'dispatch-review' ? 'review' : command === 'dispatch-repair' ? 'repair' : 'implementation', extra[1], herdr, extra[0] === '--correct-commit'), null, 2));
     else if (command === 'dispatch-implementation' && path && flag === '--controller' && controller &&
-      (extra.length === 4 || (extra.length === 6 && extra[4] === '--startup-decision')) && extra[0] === '--pane' && extra[2] === '--tab')
-      console.log(JSON.stringify(await dispatchImplementation(path, controller, extra[1], extra[3], herdr, extra[5]), null, 2));
+      (extra.length === 4 || (extra.length === 5 && extra[4] === '--reuse-pane') || (extra.length === 6 && extra[4] === '--startup-decision')) && extra[0] === '--pane' && extra[2] === '--tab')
+      console.log(JSON.stringify(await dispatchImplementation(path, controller, extra[1], extra[3], herdr, extra[5], extra[4] === '--reuse-pane'), null, 2));
     else if (command === 'accept-implementation' && path && flag === '--controller' && controller && !extra.length)
       console.log(JSON.stringify(await acceptImplementation(path, controller), null, 2));
     else if (command === 'dispatch-review' && path && flag === '--controller' && controller && !extra.length)

@@ -171,6 +171,11 @@ For unavailable workers or interruption, read [recovery.md](recovery.md).
 
 ## Worker pane cleanup
 
+Dedicated feature tabs use the opt-in [reusable shell](feature-tab.md) lifecycle:
+the assigned pane runs a worker, then returns to a shell between tasks. The rules
+below describe split-only panes; reuse mode preserves its assigned shell instead
+of closing it. It never reuses or closes the controller's conversation pane.
+
 A repair decision retains both implementer and reviewer; task_passed closes all
 accepted workers owned by that run. Escalation closes the idle old implementer
 before creating its replacement; it does not replace the reviewer. A new task

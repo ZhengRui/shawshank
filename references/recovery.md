@@ -180,7 +180,9 @@ Replacement additionally requires worker_stopped: true, worker_stop_evidence tha
 the old worker and any background writers are stopped, and partial_work describing
 what the replacement must preserve and finish. The current fingerprint must match.
 An existing old pane must be idle/done with matching identity, then is closed and
-confirmed absent before a new pane starts. Confirmed already-absent panes are safe
+confirmed absent before a new pane starts. In feature-tab reuse mode, the owned
+agent instead exits and the same pane must return to a verified shell before
+replacement starts; see [feature-tab.md](feature-tab.md). Confirmed already-absent panes are safe
 to reconcile only in the verified same session. A missing pane receipt requires
 positive no_pane_created: true and no_pane_evidence; absence of a receipt alone is
 insufficient. Partial commits and dirty files are never reset, stashed, or erased.
@@ -212,8 +214,11 @@ and `report_sha256` (SHA-256 of the exact saved report bytes). Also include
 background writers. These are evidence-backed operator assertions; a digest
 does not authenticate authorship or establish process termination.
 
-The tool requires specific `agent_not_found` AND `pane_not_found` results for
-the saved identities; a surviving shell or transport failure is not absence.
+The tool requires `agent_not_found` for the saved reviewer. Split-only mode also
+requires `pane_not_found`. Feature-tab reuse mode instead requires the assigned
+pane in the saved tab to be a verified idle shell in the worktree, never the
+controller pane. Transport failures or a busy/unidentified pane are not proof
+of termination.
 All ordinary report/coverage and clean pinned-HEAD gates still apply. Changed
 decision, report, worktree or ledger state rejects acceptance. The original
 report is preserved, exact report and decision snapshots are saved, and

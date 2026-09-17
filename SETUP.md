@@ -65,9 +65,11 @@ Use [config.example.json](configs/config.example.json) as a starting point for
 Replace project placeholders and remove irrelevant examples. Keep
 `project.commitProvenance: true` and the adaptable `project.commitTrailer` unless
 the user explicitly chooses otherwise. Test commands and environment boundaries
-must reach the task/final-review inputs; descriptive project settings do not
-automatically become checks or permissions. A default branch setting does not
-replace the explicit target ref required for whole-branch final review.
+must reach the task/final-review inputs. Whole-branch final review requires an
+explicit target ref in the approved plan input.
+Keep service URLs, test-account access instructions, forbidden targets and test
+commands in approved task/review inputs, not inert configuration fields. Do not
+copy credentials into retained inputs or reports.
 
 Use [config.local.example.json](configs/config.local.example.json) for optional
 machine/account overrides in `.shawshank/config.local.json`. Prefer account-access

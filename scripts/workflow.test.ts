@@ -158,6 +158,35 @@ test('explicit final recovery accepts exact bytes for both intents without conta
   }
 });
 
+test('final recovery accepts an exited reviewer in a reusable shell and rejects unsafe shells', async () => {
+  const f = await finalRecoveryFixture();
+  const pane = f.saved.attempts[0].pane_id;
+  const db = new Database(join(f.run, '..', 'workflow.sqlite'));
+  db.query('UPDATE runs SET config_json=? WHERE id=?').run(JSON.stringify({
+    ...JSON.parse(f.saved.run.config_json), reusePane: true, parentPane: pane, controllerPane: 'controller',
+  }), f.saved.run.id);
+  db.close();
+  let busy = true, cwd = f.root, tab = 'test-tab';
+  const call = async (...args: string[]) => {
+    if (args[0] === 'agent') throw new HerdrError('Exited', 'agent_not_found');
+    if (args[1] === 'get') return { pane: {pane_id:pane,tab_id:tab,terminal_id:'original'} };
+    if (args[1] === 'process-info') return { process_info: {pane_id:pane,shell_pid:42,
+      foreground_process_group_id:busy ? 99 : 42,
+      foreground_processes:[{pid:busy ? 99 : 42,argv0:busy ? 'vim' : 'zsh',cwd}]} };
+    throw new Error('Recovery must not mutate the pane');
+  };
+  await expect(acceptFinalReview(f.run, 'final-controller', call, f.decisionFile)).rejects.toThrow('foreground');
+  busy = false; cwd = realpathSync(tmpdir());
+  await expect(acceptFinalReview(f.run, 'final-controller', call, f.decisionFile)).rejects.toThrow('directory differs');
+  cwd = f.root; tab = 'unrelated-tab';
+  await expect(acceptFinalReview(f.run, 'final-controller', call, f.decisionFile)).rejects.toThrow('identity changed');
+  tab = 'test-tab';
+  const accepted = await acceptFinalReview(f.run, 'final-controller', call, f.decisionFile);
+  expect(accepted.stage).toBe('review_reported');
+  expect(accepted.cleanup.state).toBe('complete');
+  expect(readFileSync(f.attempt.report, 'utf8')).toBe(f.reportBytes);
+});
+
 test('final recovery rejects missing or stale evidence and live or unknown targets', async () => {
   const f = await finalRecoveryFixture();
   await expect(acceptFinalReview(f.run, 'final-controller', f.call, '')).rejects.toThrow('recovery decision file');
@@ -1005,6 +1034,98 @@ function recoveryDecision(run: string, extra: any = {}) {
     session_evidence:'Same isolated fixture transport and test tab.',resolution:'retain',...extra}));
   return file;
 }
+
+test('feature pane survives two complete task loops and final review without a spare shell split', async () => {
+  const f = dispatchFixture();
+  const previousPane = process.env.HERDR_PANE_ID;
+  process.env.HERDR_PANE_ID = 'controller';
+  const panes = new Map<string, any>([['root', { pane_id: 'root', tab_id: 'test', terminal_id: 'root-terminal' }]]);
+  const agents = new Map<string, any>();
+  const calls: string[][] = [];
+  let splits = 0;
+  const transport = async (...args: string[]) => {
+    calls.push(args);
+    if (args[0] === 'pane') {
+      if (args[1] === 'process-info') return { process_info: { pane_id: args[3], shell_pid: 42,
+        foreground_process_group_id: 42, foreground_processes: [{ pid: 42, argv0: 'zsh', cwd: f.root }] } };
+      if (args[1] === 'split') {
+        const pane = { pane_id: `review-${++splits}`, tab_id: 'test', terminal_id: `terminal-${splits}` };
+        panes.set(pane.pane_id, pane); return { pane };
+      }
+      if (args[1] === 'close') { panes.delete(args[2]); return { type: 'ok' }; }
+      const pane = panes.get(args[2]);
+      if (!pane) throw new HerdrError('closed', 'pane_not_found');
+      return { pane };
+    }
+    if (args[1] === 'start') {
+      const pane = panes.get(args[args.indexOf('--pane') + 1]);
+      const agent = { ...pane, name: args[2], agent: 'codex', agent_status: 'idle', cwd: f.root, foreground_cwd: f.root };
+      pane.agent = 'codex'; agents.set(args[2], agent); return { agent };
+    }
+    const agent = agents.get(args[2]);
+    if (args[1] === 'prompt' && args[3] === '/exit') {
+      delete panes.get(agent.pane_id).agent; agents.delete(args[2]); return { type: 'ok' };
+    }
+    return { agent };
+  };
+  try {
+    for (let index = 0; index < 2; index++) {
+      const registration = index ? JSON.parse(cli('register-task', f.input, '--controller', 'a').out) : f.registered;
+      const run = registration.run;
+      const implementation = await dispatchImplementation(run, 'a', 'root', 'test', transport, undefined, true);
+      expect(implementation.pane).toBe('root');
+      expect(panes.size).toBe(1);
+      writeFileSync(join(f.root, 'sample.ts'), `export const answer = ${42 + index};\n`);
+      f.commit();
+      const head = JSON.parse(cli('status', run).out).observed_head;
+      writeFileSync(implementation.report, JSON.stringify({ attempt_id: implementation.attempt_id,
+        base_sha: registration.base_sha, head_sha: head, status: 'DONE', concerns: [],
+        checks: [{ requirement: f.task.acceptance[0], status: 'PASS', evidence: { command: 'fixture', result: 'passed' } }] }));
+      await acceptImplementation(run, 'a', transport);
+      const review = await dispatchReview(run, 'a', transport);
+      expect(panes.size).toBe(2);
+      writeFileSync(review.report, JSON.stringify({ attempt_id: review.attempt_id,
+        base_sha: registration.base_sha, head_sha: head, evidence: 'Synthetic lifecycle review', findings: [] }));
+      await acceptReview(run, 'a', transport);
+      const decision = join(run, 'triage.json');
+      writeFileSync(decision, JSON.stringify({ attempt_id: review.attempt_id, head_sha: head, decisions: [] }));
+      const result = await recordTriage(run, 'a', decision, transport);
+      expect(result.stage).toBe('task_passed');
+      expect(result.cleanup.state).toBe('complete');
+      expect([...panes.keys()]).toEqual(['root']);
+      expect(panes.get('root').agent).toBeUndefined();
+      await cleanupWorkers(run, 'a', transport);
+    }
+    expect(splits).toBe(2);
+    expect(calls.filter(c => c[1] === 'prompt' && c[3] === '/exit')).toHaveLength(2);
+    expect(calls.some(c => c[1] === 'close' && c[2] === 'root')).toBe(false);
+    const head = Bun.spawnSync(['git', '-C', f.root, 'rev-parse', 'HEAD']).stdout.toString().trim();
+    const finalInput = { worktree: f.root, base: f.registered.base_sha, reviewedHEAD: head,
+      intent: 'report_only', entry: 'standalone',
+      scope: { reference: 'fixture scope', description: 'Both completed fixture tasks', allowedPaths: [], nonGoals: [] },
+      requiredChecks: [], runtimeMissions: [], environmentConstraints: [], taskEvidence: [],
+      authorization: { source: 'Synthetic lifecycle test', intent: 'report_only' } };
+    const finalInputPath = join(mkdtempSync(join(tmpdir(), 'shawshank-final-input-')), 'input.json');
+    writeFileSync(finalInputPath, JSON.stringify(finalInput));
+    const finalRegistration = cli('register-final-review', '--input', finalInputPath, '--controller', 'a');
+    expect(finalRegistration.code).toBe(0);
+    const finalRun = JSON.parse(finalRegistration.out).run;
+    const finalAttempt = await dispatchFinalReview(finalRun, 'a', 'root', 'test', transport, true);
+    expect(finalAttempt.pane).toBe('root');
+    expect(panes.size).toBe(1);
+    writeFileSync(finalAttempt.report, JSON.stringify({ attempt_id: finalAttempt.attempt_id,
+      base_sha: finalInput.base, head_sha: head, evidence: 'Synthetic final review', findings: [],
+      ...finalCoverageFixture({ ...f, finalInput }) }));
+    expect((await acceptFinalReview(finalRun, 'a', transport)).stage).toBe('review_reported');
+    expect([...panes.keys()]).toEqual(['root']);
+    expect(panes.get('root').agent).toBeUndefined();
+    expect(splits).toBe(2);
+    expect(calls.filter(c => c[1] === 'prompt' && c[3] === '/exit')).toHaveLength(3);
+  } finally {
+    if (previousPane === undefined) delete process.env.HERDR_PANE_ID;
+    else process.env.HERDR_PANE_ID = previousPane;
+  }
+});
 
 test('fresh CLI controller takes over before dispatch without launching anything', () => {
   const f = dispatchFixture();

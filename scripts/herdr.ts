@@ -9,6 +9,8 @@ async function rawHerdr(...args: string[]): Promise<any> {
     try { errorCode = JSON.parse(stderr || stdout).error?.code; } catch { /* Retain raw diagnostics. */ }
     throw new HerdrError(`Herdr ${args[0]} ${args[1]} failed: ${stderr || stdout}`, errorCode);
   }
+  // pane run acknowledges delivery with exit status only; callers verify state.
+  if (!stdout.trim() && args[0] === 'pane' && args[1] === 'run') return { type: 'ok' };
   const response = JSON.parse(stdout);
   if (!response.result || response.error) throw new Error(`Unexpected Herdr response: ${stdout}`);
   return response.result;

@@ -85,6 +85,7 @@ export function renderDatabase(database: string, runId?: string): string {
         if (a.cleanup_error) output.push(`   Cleanup error: ${cell(a.cleanup_error)}`);
       }
       output.push('\nDuration includes startup, execution and controller acceptance; it is not model-only time.',
+        'Cleanup closed means the worker ended; a reusable shell may remain. Feature-tab cleanup is controller-managed.',
         'A missing finish means not settled in the ledger, not necessarily still running.',
         'Experiment shutdown may leave an incomplete stage and no recorded cleanup.');
     }

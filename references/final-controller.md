@@ -16,6 +16,8 @@ repository can read them. Configuration snapshots roles.reviewer, roles.verifier
 (default/hard), roles.implementer tiers and project.commitTrailer. Entries use
 kind (codex/claude/opencode), model and explicit native CLI args. No silent fallback.
 Controller model is chosen at its launch, not by worker configuration.
+Dedicated feature tabs follow [feature-tab.md](feature-tab.md): the assigned
+shell survives reviewer exit and can host final repair, without an empty split.
 report_only requires only the reviewer; repair_loop also requires the default
 verifier. Unused repair roles need not be configured for report_only.
 
