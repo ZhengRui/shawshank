@@ -1,0 +1,9 @@
+{
+  "$comment": "Copy to .shawshank/config.local.json in the project's common checkout only if absent, then fill in local values. Keep that file Git-ignored; never put credentials in this template.",
+  "project": {
+    "testAccount": {
+      "email": "dev@example.com",
+      "password": "\u2026"
+    }
+  }
+}

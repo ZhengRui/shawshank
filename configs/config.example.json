@@ -1,0 +1,124 @@
+{
+  "$comment": "Copy to .shawshank/config.json in the project's common checkout only if absent. Adapt project settings and worker roles; machine- and person-specific values belong in .shawshank/config.local.json (see the sibling config.local.example.json). Templates are not loaded directly.",
+  "project": {
+    "defaultBranch": "main",
+    "plansDir": "docs/plans",
+    "stack": {
+      "$comment": "Project context for the controller to include in review inputs. These URLs are not automatically probed; include required checks and environment boundaries in the approved input.",
+      "appUrl": "http://localhost:PORT/",
+      "checks": [
+        {
+          "name": "app",
+          "url": "http://localhost:PORT/"
+        }
+      ]
+    },
+    "forbiddenAccounts": [
+      "<any seeded or shared account a reviewer must never sign in as>"
+    ],
+    "forbiddenHosts": [
+      "<production hostname>",
+      "<any hosted database project>"
+    ],
+    "hardTierHint": "<what makes a fix hard to verify in this codebase, e.g. 'fixes that touched subtle state or camera logic'>",
+    "fixtureNote": "Check every fixture claim in the brief against the running stack first.",
+    "testAccount": {
+      "$comment": "Set in config.local.json."
+    },
+    "commitProvenance": true,
+    "commitTrailer": "Co-Authored-By: <agent display name> <noreply@<provider domain>>"
+  },
+  "roles": {
+    "$comment": "All workers use external Herdr panes. Every role needs kind, model and args. Args are passed verbatim to the worker CLI; metadata does not inject flags. Adapt model and permission flags to the installed CLI and existing authorization. Provider identifies the configured endpoint; do not infer it solely from the harness.",
+    "taskReviewer": {
+      "$comment": "Independent external single-task reviewer for shawshank. Auto evaluates permissions; it does not bypass them.",
+      "kind": "claude",
+      "provider": "anthropic",
+      "model": "opus",
+      "args": ["--model", "opus", "--permission-mode", "auto"]
+    },
+    "reviewer": {
+      "kind": "claude",
+      "provider": "anthropic",
+      "model": "opus",
+      "args": [
+        "--model",
+        "opus",
+        "--permission-mode",
+        "auto"
+      ]
+    },
+    "verifier": {
+      "default": {
+        "kind": "codex",
+        "provider": "openai",
+        "model": "gpt-5.6-sol",
+        "effort": "medium",
+        "args": [
+          "-s",
+          "danger-full-access",
+          "-m",
+          "gpt-5.6-sol",
+          "-c",
+          "model_reasoning_effort=medium"
+        ]
+      },
+      "hard": {
+        "kind": "codex",
+        "provider": "openai",
+        "model": "gpt-5.6-sol",
+        "effort": "high",
+        "args": [
+          "-s",
+          "danger-full-access",
+          "-m",
+          "gpt-5.6-sol",
+          "-c",
+          "model_reasoning_effort=high"
+        ],
+        "$comment": "Alternative verifier selected explicitly for harder repairs."
+      }
+    },
+    "implementer": {
+      "$comment": "One example per tier; all tiers may use the same model. Choose cheap for mechanical work, standard for integration, capable for design-heavy work. Optional additional entries require explicit selection, not automatic fallback. See references/task-contract.md for repair escalation.",
+      "cheap": [
+        {
+          "kind": "opencode",
+          "model": "deepseek/deepseek-flash",
+          "args": [
+            "-m",
+            "deepseek/deepseek-flash",
+            "--auto"
+          ]
+        }
+      ],
+      "standard": [
+        {
+          "kind": "opencode",
+          "model": "deepseek/deepseek-flash",
+          "args": [
+            "-m",
+            "deepseek/deepseek-flash",
+            "--auto"
+          ]
+        }
+      ],
+      "capable": [
+        {
+          "kind": "codex",
+          "provider": "openai",
+          "model": "gpt-5.6-sol",
+          "effort": "high",
+          "args": [
+            "-s",
+            "danger-full-access",
+            "-m",
+            "gpt-5.6-sol",
+            "-c",
+            "model_reasoning_effort=high"
+          ]
+        }
+      ]
+    }
+  }
+}
