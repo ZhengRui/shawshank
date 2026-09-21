@@ -113,6 +113,13 @@ Inspect the actual requested resource and follow the user's permission boundarie
 a dispatch reference is not permission to approve broader access. Do not silently
 add persistent permissions.
 
+Every OpenCode role therefore includes an explicit `--auto` in its args, in test
+and end-to-end fixture configurations as well as real ones. Without it, OpenCode V2
+asks for approval on nearly every dispatch, report and evidence access, and each
+prompt stalls the run. Omit it only for a test whose stated purpose is the
+permission-prompt path, with the user's agreement. `--auto` approves only requests
+that are not explicitly denied; it stays a configured arg, never an injected one.
+
 ## Worker configuration
 
 Use roles.implementer for implementer tiers and roles.taskReviewer for independent
