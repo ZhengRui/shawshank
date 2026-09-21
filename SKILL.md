@@ -43,6 +43,8 @@ For an existing run, start with `status <run-path>`; do not register another.
 Status does not poll Herdr, and next_action is guidance, not proof of readiness.
 A new controller must use explicit recovery, never adopt the saved owner ID.
 Final-run takeover/replacement is not supported.
+The same owner can release a positively confirmed no-launch attempt in task or
+final dispatch via recovery's `resolve-no-launch`; this never launches or prompts.
 
 Before dispatch, establish the approved scope, repository, local commit authority
 and allowed Herdr parent pane/tab. Inspect Git state and preserve unrelated work.
@@ -76,9 +78,12 @@ documented in the task contract.
 Use explicit worker names/panes and bounded `herdr agent wait <worker>
 --timeout 30000`. Both idle and done are settled; inspect blocked/unknown states.
 A timeout is not proof of non-delivery and never authorizes a repeated prompt.
-For OpenCode only, wait for the input UI to appear, then allow three more seconds
-before the first task message. The transport does this at startup without sending
-a probe message; other worker kinds are unchanged.
+OpenCode startup is version-aware: V1 waits for its input UI plus three seconds;
+V2 verifies a fresh full-TUI session through lifecycle hooks and the session API.
+Both verify controller/pane executable agreement before launch; bounded readiness
+polls never repeat a launch or task prompt.
+See [OpenCode launch contract](references/task-contract.md#opencode-launch-contract)
+for supported arguments and prerequisites. No probe task is sent.
 Read the report before acceptance. Worker completion alone does not pass a task.
 
 Worker duties are in [implementer.md](references/implementer.md),

@@ -52,6 +52,19 @@ the roles needed for the intended workflow; report-only final review only needs
 its reviewer. See [task contract](references/task-contract.md) and
 [final controller](references/final-controller.md) for execution requirements.
 
+### OpenCode prerequisites
+
+Use the version-specific [launch contract](references/task-contract.md#opencode-launch-contract),
+not V1 flags copied directly into a V2 terminal command.
+The controller and assigned shell must resolve the same local OpenCode executable
+and version and share its local background service. Both V1 and V2 require
+zsh/bash/sh/fish for the executable probe; unsupported shells fail before launch.
+V2 requires Herdr's full-TUI lifecycle integration (tested with Herdr 0.9.1 and
+OpenCode 2.0.11); Mini is not a substitute. Install or upgrade only with authorization.
+Fix reported prerequisite mismatches explicitly; do not fall back to another transport.
+Account for [external-reference approval prompts](references/task-contract.md#external-reference-permissions)
+when placing inputs outside the worker repository.
+
 ## 3. Adapt project settings
 
 Read the project's agent instructions, package/tool configuration and development

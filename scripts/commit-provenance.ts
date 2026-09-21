@@ -15,6 +15,8 @@ export function launchAttribution(worker: any = {}) {
     });
     return value;
   };
+  // Dispatch attribution precedes version discovery. Preserve selectors here;
+  // only the V2 launcher decodes #variant after validating its contract.
   const model = option('-m', '--model') ?? worker.model ?? 'unknown';
   const configuredEffort = typeof worker.effort === 'string' && /^[a-z-]+$/.test(worker.effort)
     ? worker.effort : 'unknown';
@@ -55,7 +57,7 @@ export function validateProvenance(message: string, enabled: boolean, expected?:
     throw new Error('Missing or invalid commit provenance: Co-Authored-By must share the final trailer block');
   const compact = block.split('\n').filter(line => line.startsWith('Agent:'));
   if (compact.length) {
-    const value = '[A-Za-z0-9][A-Za-z0-9._/:+() -]*';
+    const value = '[A-Za-z0-9][A-Za-z0-9._/:+#() -]*';
     if (compact.length !== 1 || /^Agent-(Provider|Model|Reasoning-Effort|Harness):/m.test(block) ||
         !new RegExp(`^Agent: provider=${value}; model=${value}; effort=${value}; harness=${value}$`).test(compact[0]))
       throw new Error('Missing or invalid commit provenance: Agent');
@@ -63,7 +65,7 @@ export function validateProvenance(message: string, enabled: boolean, expected?:
     // Existing commits and in-flight dispatches may still use the original format.
     for (const key of ['Agent-Provider', 'Agent-Model', 'Agent-Reasoning-Effort', 'Agent-Harness']) {
       const entries = block.split('\n').filter(line => line.startsWith(`${key}:`));
-      if (entries.length !== 1 || !new RegExp(`^${key}: [A-Za-z0-9][A-Za-z0-9._/:+() -]*$`).test(entries[0]))
+      if (entries.length !== 1 || !new RegExp(`^${key}: [A-Za-z0-9][A-Za-z0-9._/:+#() -]*$`).test(entries[0]))
         throw new Error(`Missing or invalid commit provenance: ${key}`);
     }
   }

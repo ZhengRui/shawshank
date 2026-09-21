@@ -28,6 +28,8 @@ test('C1 separated attribution is rejected and contiguous trailers agree with Gi
 });
 
 test('launch values prefer CLI selections and preserve unknown defaults', () => {
+  expect(launchAttribution({ kind: 'opencode', args: ['-m', 'vendor/model#high'] }))
+    .toEqual({ provider: 'vendor', model: 'vendor/model#high', effort: 'unknown', harness: 'opencode' });
   expect(launchAttribution({ kind: 'codex', provider: 'openai', model: 'old', effort: 'low',
     args: ['-m', 'gpt-6-astra', '-c', 'model_reasoning_effort="medium"'] })).toEqual({
       provider: 'openai', model: 'gpt-6-astra', effort: 'medium', harness: 'codex' });
@@ -35,6 +37,19 @@ test('launch values prefer CLI selections and preserve unknown defaults', () => 
     effort: "high (opencode's remembered variant)", args: [] }).effort).toBe('unknown');
   expect(launchAttribution({ kind: 'claude', args: ['--model=opus', '--effort', 'high'] }))
     .toEqual({ provider: 'unknown', model: 'opus', effort: 'high', harness: 'claude' });
+});
+
+test('pre-version attribution preserves hash selectors and prefers explicit variant evidence', () => {
+  for (const selector of ['vendor/model#high', 'vendor/model#high#extra']) {
+    for (const role of [{ model: selector }, { args: ['-m', selector] }]) {
+      const values = launchAttribution({ kind: 'opencode', ...role });
+      expect(values.model).toBe(selector);
+      expect(values.effort).toBe('unknown');
+    }
+  }
+  const values = launchAttribution({ kind: 'opencode', args: ['-m', 'vendor/model#high', '--variant', 'high'] });
+  expect(values.effort).toBe('high');
+  expect(() => validateProvenance(compact.replace('model=deepseek/deepseek-flash', 'model=vendor/model#high'), true)).not.toThrow();
 });
 
 test('known launch values cannot be discarded but runtime alias resolution remains allowed', () => {

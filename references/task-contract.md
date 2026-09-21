@@ -61,6 +61,17 @@ records that worker, project commit trailer, parent pane, and allowed tab. It
 supports codex/opencode/claude entries with explicit args. Unsupported entries stop;
 automatic availability fallback is not implemented.
 
+### External-reference permissions
+
+Standalone briefs remain at their caller-owned paths. When outside the worker's
+repository, they can trigger an OpenCode external-directory approval prompt in
+each fresh session, depending on its permission configuration. Final-stage workers
+also read shared instructions such as `references/final-reviewer.md`, which can
+trigger the same prompt when the skill is outside the repository.
+Inspect the actual requested resource and follow the user's permission boundaries;
+a dispatch reference is not permission to approve broader access. Do not silently
+add persistent permissions. Plan-linked briefs use run-local snapshots instead.
+
 ## Worker configuration
 
 Use roles.implementer for implementer tiers and roles.taskReviewer for independent
@@ -72,9 +83,9 @@ a saved reviewer resolve roles.taskReviewer at first review. Configure
 taskReviewer before starting a new task review.
 
 Implementer tiers and the task reviewer are independently configurable. Each selected
-entry requires kind, model, and an explicit args array. Args are native CLI
-arguments passed verbatim; model is recorded metadata, not an automatically
-injected flag. Keep the model selection in args consistent with model. For example,
+entry requires kind, model, and an explicit args array. Args are passed verbatim
+except for OpenCode V2 selection flags described below; model is recorded metadata,
+not an automatically injected flag. Keep args consistent with model. For example,
 a Claude entry is {"kind":"claude","model":"sonnet","args":["--model","sonnet"]}.
 Use the installed CLI help to choose supported model and effort flags. Do not
 silently add permission bypasses. Empty args deliberately uses CLI defaults.
@@ -82,9 +93,9 @@ silently add permission bypasses. Empty args deliberately uses CLI defaults.
 Use the project's authorized permission settings unless explicitly overridden.
 `project.workerPermissionPolicy`, when present, records the project's existing
 authorization; it does not grant new authority or alter launch args.
-The dispatcher passes args verbatim: it does not inject permission flags, rewrite
-user overrides, or alter saved role snapshots. An explicit Auto override remains
-valid and may still request approval; do not silently change a running session.
+The dispatcher does not inject permission flags or alter saved role snapshots.
+An explicit Auto override remains valid and may still request approval;
+do not silently change a running session.
 
 All three kinds run as external Herdr agents with the same reports, acceptance,
 repair, recovery, and cleanup rules. No Claude Agent API, native-subagent fallback,
@@ -95,6 +106,53 @@ Retained implementers carry their saved launch metadata into repair prompts.
 An explicit replacement or tier escalation updates the current implementer
 snapshot; historical dispatches remain unchanged. Older runs without a matching
 snapshot retain only known kind/model values rather than borrowing current settings.
+
+### OpenCode launch contract
+
+Only V1 and V2 are supported; 0.x and unknown versions fail closed.
+Check [OpenCode prerequisites](../SETUP.md#opencode-prerequisites) before dispatch,
+including the supported-shell requirement. A one-shot probe rejects controller/pane
+executable or version mismatches before session creation; API calls use the verified executable.
+The probe writes only a temporary receipt, removed after confirmed completion
+or a definite pre-send failure. Once sending is attempted, an incomplete receipt
+is retained for inspection, never automatically replayed.
+Readiness checks wait within bounded limits for incomplete observations and the
+probe's transient agent detection to clear; conflicting identities fail immediately.
+V1 passes args unchanged and waits for `Ask anything` plus three seconds.
+
+V2 accepts `-m`/`--model provider/model[#variant]`, `--variant value`,
+`--agent value`, and explicit `--auto`. Selection flags configure a fresh session
+through `opencode api session.create` in the verified worker shell directory;
+Herdr starts the full TUI with its returned `--session` ID. No project/global
+configuration is written. Omitted selections use OpenCode defaults, not role
+metadata; an unspecified variant is not a fixed effort claim.
+Prefer explicit `--variant` for launch attribution. Dispatch attribution runs
+before version discovery, so it preserves model selectors verbatim and never
+infers effort from `#variant` in CLI args or model metadata. Only the V2 launcher
+validates and decodes that suffix; workers may update attribution from verified
+session evidence. Malformed or conflicting V2 selectors are rejected, not truncated.
+Mini, run, resume/continue, startup prompts, alternate servers and other arguments
+are rejected before session creation, rather than silently translated or dropped.
+
+Before task input, verify the exact lifecycle-reported session, pane identity,
+settled status, directory and explicit model/agent/variant via `session.get`.
+Missing hook evidence or working/unknown status gets the same bounded read-only
+polling, even when hooks are complete. Blocked/unexpected status and conflicting
+worker/session identities fail immediately. Complete evidence, idle/done and the
+session API check are all required before task input.
+The API prepares and inspects sessions only; task prompts still use Herdr.
+Failed/uncertain creation or startup is not retried automatically. Retain the
+reported session ID and pane, reconcile against the attempt, and follow
+[startup recovery](recovery.md#startup-and-unavailable-task-reviewers).
+Do not infer delivery from an idle session or delete uncertain sessions.
+Structured errors preserve the original code/cause and distinguish `prelaunch`,
+`session-create`, and `session-start`. V2 failures do not enter the legacy
+`startup_blocked` shortcut because it does not revalidate V2 sessions.
+
+Upstream contracts: [OpenCode V2 API](https://opencode.ai/v2/docs/api) and
+[Herdr OpenCode integration](https://herdr.dev/docs/integrations/#opencode).
+
+### Dispatch and acceptance
 
 The parent pane must be in the explicitly authorized tab. Dispatch creates a new
 pane without focus and leaves it available for later review/repair. It does not

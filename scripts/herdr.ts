@@ -1,3 +1,8 @@
+import { openCodeCLI, openCodeVersion, prepareOpenCodeV2, verifyOpenCodeInstallation,
+  type OpenCodeCLI, type InstallationProbe } from './opencode';
+import { HerdrError, startupError } from './startup';
+export { HerdrError, startupBlocked } from './startup';
+
 // Explicit targets are required: the tool executor may not inherit pane context.
 async function rawHerdr(...args: string[]): Promise<any> {
   const child = Bun.spawn(['herdr', ...args], { stdout: 'pipe', stderr: 'pipe' });
@@ -16,17 +21,34 @@ async function rawHerdr(...args: string[]): Promise<any> {
   return response.result;
 }
 
-export class HerdrError extends Error {
-  constructor(message: string, public code?: string) { super(message); }
-}
-
 export type HerdrCall = (...args: string[]) => Promise<any>;
 
-// Only OpenCode needs a startup grace period after its input widget appears.
-export function withOpenCodeStartupWait(raw: HerdrCall, wait = (ms: number) => Bun.sleep(ms)): HerdrCall {
+// V1 uses UI readiness; V2 binds a fresh session to full-TUI lifecycle hooks.
+export function withOpenCodeStartupWait(raw: HerdrCall, wait = (ms: number) => Bun.sleep(ms),
+  cli: OpenCodeCLI = openCodeCLI, probe: InstallationProbe = verifyOpenCodeInstallation): HerdrCall {
   return async (...args) => {
+    const isOpenCode = args[0] === 'agent' && args[1] === 'start' && args[args.indexOf('--kind') + 1] === 'opencode';
+    if (isOpenCode) {
+      let installation;
+      let major;
+      try {
+        installation = await probe(raw, args, cli, wait);
+        major = openCodeVersion(installation.version).major;
+      } catch (error) { throw startupError(error, 'prelaunch'); }
+      if (major === 2) {
+        let launch;
+        try { launch = await prepareOpenCodeV2(raw, args, installation.cli, wait); }
+        catch (error) { throw startupError(error, 'prelaunch'); }
+        try {
+          const result = await raw(...launch.args);
+          return { ...result, agent: await launch.verify(result.agent) };
+        } catch (error) {
+          throw startupError(error, 'session-start', launch.sessionID);
+        }
+      }
+    }
     const result = await raw(...args);
-    if (args[0] === 'agent' && args[1] === 'start' && args[args.indexOf('--kind') + 1] === 'opencode') {
+    if (isOpenCode) {
       const before = result.agent;
       try {
         if (before?.name !== args[2] || before.agent !== 'opencode' ||
