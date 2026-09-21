@@ -383,9 +383,8 @@ export async function amendPlanScope(planPath: string, controller: string, decis
     const attempts = db.query('SELECT * FROM attempts WHERE run_id=? ORDER BY rowid DESC').all(run.id) as any[];
     const seen = new Set<string>();
     for (const attempt of attempts) {
-      if (!attempt.pane_id || seen.has(attempt.pane_id)) continue;
+      if (!attempt.pane_id || attempt.cleanup_state === 'closed' || seen.has(attempt.pane_id)) continue;
       seen.add(attempt.pane_id);
-      if (attempt.cleanup_state === 'closed') continue;
       if (attempt.status !== 'accepted') throw new Error('Unsettled attempt blocks scope amendment');
       const live = (await call('agent', 'get', attempt.worker_name)).agent;
       ready(live, attempt, JSON.parse(run.config_json).tab);
@@ -754,7 +753,21 @@ export async function resolveNoLaunch(runPath: string, controller: string, decis
     noLaunchWorktree(run, attempt);
     if (decision.prompt_submitted !== false) throw new Error('Positive non-submission evidence required');
     required(decision.non_submission_evidence, 'positive non-submission evidence');
-    required(decision.no_agent_evidence, 'no agent evidence');
+    const retained = attempt.pane_id && ['review', 'repair'].includes(attempt.action)
+      ? db.query(`SELECT * FROM attempts WHERE run_id=? AND status='accepted'
+          AND worker_name=? AND pane_id=? AND worker_kind=? AND model=?
+          AND COALESCE(cleanup_state,'')!='closed' ORDER BY rowid DESC LIMIT 1`)
+        .get(run.id, attempt.worker_name, attempt.pane_id, attempt.worker_kind, attempt.model) as any : null;
+    if (retained) {
+      if (decision.retained_attempt_id !== retained.id ||
+          !(attempt.action === 'review' ? retained.action === 'review' : ['implementation', 'repair'].includes(retained.action)))
+        throw new Error('Retained worker evidence must identify its accepted attempt');
+      required(decision.retained_worker_evidence, 'retained worker identity and no remaining writers evidence');
+      if (decision.no_session_created !== true) throw new Error('Retained dispatch must establish no new session created');
+    } else {
+      if (decision.retained_attempt_id != null) throw new Error('No matching accepted retained worker');
+      required(decision.no_agent_evidence, 'no agent evidence');
+    }
     required(decision.session_creation_evidence, 'session creation evidence');
     if (decision.no_session_created === true && (decision.session_id != null || decision.session_unused != null))
       throw new Error('Conflicting session creation evidence');
@@ -762,27 +775,31 @@ export async function resolveNoLaunch(runPath: string, controller: string, decis
         !(attempt.worker_kind === 'opencode' && isOpenCodeSessionID(decision.session_id) && decision.session_unused === true))
       throw new Error('Establish no session created or identify the unused session');
     const before = recoverySnapshot(db, run);
-    try {
-      await call('agent', 'get', attempt.worker_name);
-      throw new Error('Worker still exists; no-launch recovery refused');
-    } catch (error) {
-      if (!(error instanceof HerdrError && error.code === 'agent_not_found')) throw error;
-    }
     const config = JSON.parse(run.config_json);
-    if (!attempt.pane_id) {
-      if (decision.no_pane_created !== true) throw new Error('Missing pane receipt requires no_pane_created');
-      required(decision.no_pane_evidence, 'no pane evidence');
+    if (retained) {
+      ready(await recoveryAgent(run, attempt, call), attempt, config.tab);
     } else {
       try {
-        const pane = (await call('pane', 'get', attempt.pane_id)).pane;
-        if (pane?.pane_id !== attempt.pane_id || pane.tab_id !== config.tab || pane.agent)
-          throw new Error('Pane identity or absence of agent is not confirmed');
-        if (!config.reusePane || attempt.pane_id !== config.parentPane || attempt.pane_id === config.controllerPane)
-          throw new Error('Close the confirmed unused split pane before releasing its attempt');
-        const shell = await shellPane(call, attempt.pane_id, config.tab);
-        if (realpathSync(shell.shell.cwd) !== run.worktree_path) throw new Error('Reusable shell directory changed');
+        await call('agent', 'get', attempt.worker_name);
+        throw new Error('Worker still exists; no-launch recovery refused');
       } catch (error) {
-        if (!(error instanceof HerdrError && error.code === 'pane_not_found')) throw error;
+        if (!(error instanceof HerdrError && error.code === 'agent_not_found')) throw error;
+      }
+      if (!attempt.pane_id) {
+        if (decision.no_pane_created !== true) throw new Error('Missing pane receipt requires no_pane_created');
+        required(decision.no_pane_evidence, 'no pane evidence');
+      } else {
+        try {
+          const pane = (await call('pane', 'get', attempt.pane_id)).pane;
+          if (pane?.pane_id !== attempt.pane_id || pane.tab_id !== config.tab || pane.agent)
+            throw new Error('Pane identity or absence of agent is not confirmed');
+          if (!config.reusePane || attempt.pane_id !== config.parentPane || attempt.pane_id === config.controllerPane)
+            throw new Error('Close the confirmed unused split pane before releasing its attempt');
+          const shell = await shellPane(call, attempt.pane_id, config.tab);
+          if (realpathSync(shell.shell.cwd) !== run.worktree_path) throw new Error('Reusable shell directory changed');
+        } catch (error) {
+          if (!(error instanceof HerdrError && error.code === 'pane_not_found')) throw error;
+        }
       }
     }
     db.transaction(() => {
@@ -937,7 +954,7 @@ function saveAttempt(db: Database, run: any, controller: string, stage: string, 
 }
 
 export async function replaceWorker(runPath: string, controller: string, decisionFile: string, call: HerdrCall = herdr) {
-  const { path, db, run } = openRun(runPath);
+  const { path, db, run } = openRun(runPath, 'either');
   call = guardedTransport(db,run.id,controller,call);
   let claimed = false;
   try {
@@ -947,12 +964,31 @@ export async function replaceWorker(runPath: string, controller: string, decisio
     required(decision.worker_stop_evidence, 'worker termination and no remaining writers evidence');
     required(decision.partial_work, 'partial work continuation decision');
     const previous = db.query('SELECT * FROM attempts WHERE run_id=? ORDER BY rowid DESC LIMIT 1').get(run.id) as any;
+    const final = run.kind === 'final_review';
+    const stages = final
+      ? { final_review: ['final_dispatching', 'final_reviewing'], repair: ['final_repair_dispatching', 'final_repairing'],
+          verification: ['final_verification_dispatching', 'final_verifying'] }
+      : { implementation: ['dispatching', 'implementing'], review: ['review_dispatching', 'reviewing'],
+          repair: ['repair_dispatching', 'implementing'] };
+    const transitions = (stages as Record<string, string[]>)[previous?.action];
     if (!previous || previous.id !== decision.attempt_id || !['prepared','startup_blocked','prompting','submitted','replaced'].includes(previous.status) ||
-      !['dispatching','review_dispatching','repair_dispatching','implementing','reviewing'].includes(run.stage))
+      !transitions?.includes(run.stage))
       throw new Error('Replacement requires the outstanding attempt');
     const config = JSON.parse(run.config_json);
-    const worker = previous.action === 'review' ? config.reviewer : config.implementerTiers?.[run.tier]?.[decision.worker_index ?? 0];
+    const readOnly = ['review', 'final_review', 'verification'].includes(previous.action);
+    const finalDecision = final && previous.action !== 'final_review' ? JSON.parse(readFileSync(run.decision_path, 'utf8')) : null;
+    if (final) {
+      if (existsSync(previous.report_path)) throw new Error('Final report exists; use delivery acceptance or correction, not replacement');
+      if (decision.worker_index != null) throw new Error('Final replacement must preserve the selected role');
+      if (readOnly) cleanHead(run, previous.head_sha);
+    }
+    const worker = final
+      ? previous.action === 'final_review' ? config.reviewer : previous.action === 'verification'
+        ? config.verifier?.[finalDecision.verifier_tier] : config.implementerTiers?.[finalDecision.implementer_tier]?.[0]
+      : previous.action === 'review' ? config.reviewer : config.implementerTiers?.[run.tier]?.[decision.worker_index ?? 0];
     if (!worker || !['codex','opencode','claude'].includes(worker.kind)) throw new Error('Supported snapshotted replacement worker required');
+    if (final && (worker.kind !== previous.worker_kind || worker.model !== previous.model))
+      throw new Error('Final replacement role differs from the interrupted attempt');
     strings(worker.args, 'replacement args');
     required(worker.model, 'replacement model');
     const parent = (await call('pane', 'get', config.parentPane)).pane;
@@ -1018,19 +1054,21 @@ export async function replaceWorker(runPath: string, controller: string, decisio
     const name = `aw-${id.slice(0,20)}`;
     const dispatch = join(path, `${id}-dispatch.md`);
     const report = join(path, `${id}-report.json`);
-    const stage = previous.action === 'review' ? 'review_dispatching' : previous.action === 'repair' ? 'repair_dispatching' : 'dispatching';
+    const [stage, submitted] = transitions;
     db.transaction(() => {
       owned(db, run.id, controller, run.stage,true);
       recoveryInput(decisionFile, run);
+      if (final && existsSync(previous.report_path)) throw new Error('Final report appeared during replacement; inspect delivery');
+      if (final && readOnly) cleanHead(run, previous.head_sha);
       const latest = db.query('SELECT id FROM attempts WHERE run_id=? ORDER BY rowid DESC LIMIT 1').get(run.id) as any;
       if (latest.id !== previous.id) throw new Error('Replacement already claimed');
       const saved = join(path, `replacement-${randomUUID()}.json`);
       writeFileSync(saved, JSON.stringify({...decision,replacement_attempt_id:id}, null, 2), {flag:'wx'});
       config.lastRecoveryDecision = saved;
       config.lastReplacementDecision = saved;
-      if (previous.action !== 'review') config.worker = roleSnapshot(worker);
+      if (!readOnly && !final) config.worker = roleSnapshot(worker);
       writeFileSync(dispatch, `# Explicit continuation after worker replacement\n\n` +
-        (previous.action === 'review' || previous.correction_count ? '' :
+        (readOnly || previous.correction_count ? '' :
           provenanceInstructions(config.commitProvenance, roleSnapshot(worker), decision.head_sha)) +
         `Preserve existing commits and dirty files. Do not reset or discard partial work.\n` +
         `Continuation decision: ${decision.partial_work}\nObserved HEAD: ${decision.head_sha}\n` +
@@ -1072,7 +1110,7 @@ export async function replaceWorker(runPath: string, controller: string, decisio
     db.transaction(() => {
       owned(db,run.id,controller,stage);
       db.query("UPDATE attempts SET status='submitted' WHERE id=?").run(id);
-      db.query('UPDATE runs SET stage=?,blocked_reason=NULL WHERE id=?').run(previous.action === 'review' ? 'reviewing' : 'implementing',run.id);
+      db.query('UPDATE runs SET stage=?,blocked_reason=NULL WHERE id=?').run(submitted,run.id);
     }).immediate();
     return {run:path,attempt_id:id,worker:name,pane:pane.pane_id,report,repair_count:run.repair_count};
   } catch (error) {
@@ -1551,13 +1589,13 @@ async function dispatchFinalAttempt(runPath: string, controller: string,
     const from = initial ? 'final_ready' : repair ? 'final_repair_ready' : 'final_verification_ready';
     const dispatching = initial ? 'final_dispatching' : repair ? 'final_repair_dispatching' : 'final_verification_dispatching';
     const submitted = initial ? 'final_reviewing' : repair ? 'final_repairing' : 'final_verifying';
-    cleanHead(run);
     let attempt: any;
     if (run.stage === dispatching) {
       owned(db, run.id, controller, dispatching);
       if (config.parentPane !== parentPane || config.tab !== tab) throw new Error('Dispatch target changed');
       attempt = db.query("SELECT * FROM attempts WHERE run_id=? AND action=? AND status='startup_blocked'").get(run.id, action);
       if (!attempt) throw new Error('Final dispatch unresolved; replay is forbidden');
+      startupWorktree(run, attempt);
       ready((await call('agent', 'get', attempt.worker_name)).agent, attempt, tab);
       db.transaction(() => {
         owned(db, run.id, controller, dispatching);
@@ -1567,6 +1605,7 @@ async function dispatchFinalAttempt(runPath: string, controller: string,
       claimed = true;
     } else {
       owned(db, run.id, controller, from);
+      cleanHead(run);
       const decision = initial ? null : JSON.parse(readFileSync(run.decision_path, 'utf8'));
       if (repair && run.repair_count >= 3) throw new Error('Final repair budget exhausted; user judgment required');
       if (repair) required(config.trailer, 'commit trailer');
@@ -2234,7 +2273,8 @@ export async function dispatchImplementation(runPath: string, controller: string
         dispatch_path,report_path,base_sha,started_at) VALUES (?,?,'implementation','prepared',?,?,?,?,?,?,?)`)
         .run(id, run.id, worker.kind, worker.model, name, dispatch, report, run.base_sha, now);
       db.query('UPDATE runs SET stage=?,config_json=?,updated_at=? WHERE id=?')
-        .run('dispatching', JSON.stringify({ ...placement, worker: roleSnapshot(worker), trailer, parentPane, tab,
+        .run('dispatching', JSON.stringify({ lastNoLaunchDecision: JSON.parse(run.config_json).lastNoLaunchDecision,
+          ...placement, worker: roleSnapshot(worker), trailer, parentPane, tab,
           commitProvenance: config.project?.commitProvenance === true,
           reviewer: roleSnapshot(config.roles?.taskReviewer), implementerTiers: tierSnapshot(config) }), now, run.id);
     }).immediate();

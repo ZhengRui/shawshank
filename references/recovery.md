@@ -52,7 +52,9 @@ does not programmatically repeat V2 hook/session validation: the operator must
 perform the checks above before using it. Final runs have no live-session V2
 startup reconciliation path. If bounded startup verification fails with a live
 agent, preserve the session and stop for user judgment; `resolve-no-launch`
-cannot release a live worker and must not be used to bypass these checks.
+cannot release a newly launched live worker and must not bypass these checks.
+Explicit replacement after confirmed stop is available below; it starts a fresh
+validated worker rather than resuming an uncertain startup.
 For an uncertain executable-probe receipt, inspect the original shell and retained
 receipt first; do not rerun the probe while it might still be executing.
 
@@ -69,9 +71,10 @@ Use this only after the failed command and any shell probe have stopped. Include
 the standard recovery fields below (`previous_controller`, `stage`, `attempt_id`,
 `previous_command_stopped`, `evidence`, `session_evidence`, `head_sha`,
 `worktree_fingerprint`), plus `resolution: "no_launch"`, `prompt_submitted: false`,
-concrete `non_submission_evidence`, `no_agent_evidence`, and
-`session_creation_evidence`. Establish either `no_session_created: true`, or
-the exact `session_id` with `session_unused: true` and evidence that it has no
+concrete `non_submission_evidence` and `session_creation_evidence`.
+For a fresh launch, also supply `no_agent_evidence`. Establish either
+`no_session_created: true`, or the exact `session_id` with `session_unused: true`
+and evidence that it has no
 messages/execution. The known-unused-session branch is supported only for OpenCode;
 other worker kinds require `no_session_created: true`.
 Unknown session creation is not sufficient. These are positive
@@ -84,20 +87,31 @@ its continuation and budgets. First confirm its unused split pane absent (close
 only after inspection), or verify the assigned reusable shell; do not discard
 partial commits or dirty files to qualify for no-launch rollback.
 
-The command requires the named agent to return `agent_not_found`. A split pane
+For fresh launches, the named agent must return `agent_not_found`. A split pane
 must already be confirmed absent: inspect and close only the positively identified
 unused owned pane before recovery. An authorized reusable pane may remain as a
 verified shell in the worktree, with no agent. If no pane was recorded, also supply
 `no_pane_created: true` and `no_pane_evidence`. Transport errors are not absence.
 Never close a live or uncertain worker to manufacture no-launch evidence.
 
+For a retained task repairer, task re-reviewer or final repairer, instead supply
+`retained_attempt_id` identifying its prior accepted attempt and concrete
+`retained_worker_evidence` establishing the same worker and no remaining writers.
+The recorded name, kind, model and pane must match the accepted worker; live
+name, kind, pane, tab and directories must match and the worker must be idle/done.
+Use `no_session_created: true` for this new dispatch, not an unused-session claim:
+historical messages in the retained session are expected. Positive non-submission
+evidence must refer to THIS attempt, never merely to the settled worker status.
+Recovery abandons only the new attempt, preserving the accepted worker's cleanup
+ownership and releasing only the unused repair reservation. It sends no prompt.
+
 Recovery saves the decision, marks the old attempt `no_launch`, releases its
 cleanup claim, and returns to the prior ready stage. Any unused repair reservation
 and task escalation are restored. It preserves dispatch/report artifacts and
 sends no launch or prompt. A subsequent explicit normal dispatch creates a fresh
 attempt; it does not replay the abandoned one. This command neither transfers
-ownership nor reconciles `prompting`/submitted work or a live V2 session. Those
-remain under the existing recovery rules and final-run limits.
+ownership nor reconciles `prompting`/submitted work or a newly launched live V2
+session. Those remain under the existing recovery rules and final-run limits.
 
 If the retained reviewer is unavailable or its identity changes, dispatch stops
 without sending the prompt or silently launching another reviewer. Inspect the
@@ -256,11 +270,21 @@ stop for another explicit decision rather than retrying blindly.
 
 ## Final-run limits
 
-Final-run takeover and worker replacement are not implemented. Do not apply task
-recovery commands or adopt the old controller ID. Stop for an interrupted owner
-or ambiguous execution and report the saved/live evidence. Same-owner normal
-transitions, confirmed no-launch recovery above, and explicit report/commit-message
-correction remain available.
+Final-run takeover is not implemented. Do not apply take-over or adopt the old
+controller ID. Stop for an interrupted owner and report the saved/live evidence.
+Same-owner normal transitions, confirmed no-launch recovery and explicit
+report/commit-message correction remain available.
+
+The current owner may use replace-worker with the stop/partial-work evidence
+above for an outstanding final review, repair or verification attempt BEFORE its
+report exists. This is a new continuation attempt, not replay or a new review/
+repair round. It preserves the selected snapshotted role (no worker_index), pinned
+base/HEAD, review/repair IDs, findings, repair count and correction budget.
+Reviewers and verifiers require the unchanged clean reviewed HEAD; repairers
+preserve inspected partial commits and dirty files. Existing reports must go
+through acceptance/correction, and accepted reviews cannot be reopened.
+Interrupted commit-message correction is not eligible. An uncertain replacement
+launch must be inspected before another explicit replacement; no automatic retry.
 
 ### Initial report after worker exit
 

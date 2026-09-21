@@ -42,7 +42,8 @@ Read the matching reference before action and again after losing context:
 For an existing run, start with `status <run-path>`; do not register another.
 Status does not poll Herdr, and next_action is guidance, not proof of readiness.
 A new controller must use explicit recovery, never adopt the saved owner ID.
-Final-run takeover/replacement is not supported.
+Final-run takeover is not supported. The same owner may replace an interrupted
+final worker before report delivery using recovery's stop-evidence rules.
 The same owner can release a positively confirmed no-launch attempt in task or
 final dispatch via recovery's `resolve-no-launch`; this never launches or prompts.
 
