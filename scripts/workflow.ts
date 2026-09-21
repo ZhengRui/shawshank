@@ -25,6 +25,18 @@ function strings(value: unknown, name: string, nonempty = false): string[] {
   return value;
 }
 
+// OpenCode V2 asks for approval on nearly every access outside the worker tree;
+// an unattended worker must carry its configured --auto. It is never injected.
+function requireAuto(worker: any, name: string) {
+  if (worker?.kind === 'opencode' && !(Array.isArray(worker.args) && worker.args.includes('--auto')))
+    throw new Error(`${name} must include --auto for OpenCode workers`);
+}
+
+function launchArgs(worker: any, name: string): string[] {
+  requireAuto(worker, name);
+  return strings(worker.args, name);
+}
+
 function paths(worktree: string) {
   const common = git(worktree, 'rev-parse', '--path-format=absolute', '--git-common-dir');
   const checkout = dirname(common);
@@ -143,8 +155,9 @@ function validateFinalInput(input: any) {
   if (Bun.spawnSync(['git', '-C', location.checkout, 'check-ignore', '-q', location.database]).exitCode !== 0)
     throw new Error('Ignore .shawshank/runs/ in the common checkout before registration');
   const config = projectConfig(worktree);
-  const snapshot = { finalReviewStandard: 1, reviewer: roleSnapshot(config.roles?.reviewer),
-    verifier: { default: roleSnapshot(config.roles?.verifier?.default), hard: roleSnapshot(config.roles?.verifier?.hard) },
+  const snapshot = { finalReviewStandard: 1, reviewer: projectRole(config.roles?.reviewer, 'roles.reviewer args'),
+    verifier: { default: projectRole(config.roles?.verifier?.default, 'roles.verifier.default args'),
+      hard: projectRole(config.roles?.verifier?.hard, 'roles.verifier.hard args') },
     implementerTiers: tierSnapshot(config), trailer: config.project?.commitTrailer,
     commitProvenance: config.project?.commitProvenance === true };
   if (!snapshot.reviewer) throw new Error('Final reviewer configuration required');
@@ -989,7 +1002,7 @@ export async function replaceWorker(runPath: string, controller: string, decisio
     if (!worker || !['codex','opencode','claude'].includes(worker.kind)) throw new Error('Supported snapshotted replacement worker required');
     if (final && (worker.kind !== previous.worker_kind || worker.model !== previous.model))
       throw new Error('Final replacement role differs from the interrupted attempt');
-    strings(worker.args, 'replacement args');
+    launchArgs(worker, 'replacement args');
     required(worker.model, 'replacement model');
     const parent = (await call('pane', 'get', config.parentPane)).pane;
     if (parent?.pane_id !== config.parentPane || parent.tab_id !== config.tab) throw new Error('Replacement parent identity differs');
@@ -1260,9 +1273,16 @@ function validateDispatchedProvenance(message: string, commit: string, run: any,
   validateProvenance(message, enabled, contract && !inherited ? contract.values : undefined);
 }
 
+// Roles read from project configuration are checked when snapshotted; a later
+// stage must not meet a saved role that can no longer be corrected.
+function projectRole(worker: any, name: string) {
+  requireAuto(worker, name);
+  return roleSnapshot(worker);
+}
+
 function tierSnapshot(config: any) {
   return Object.fromEntries(['cheap', 'standard', 'capable'].map(tier =>
-    [tier, (config.roles?.implementer?.[tier] ?? []).map(roleSnapshot)]));
+    [tier, (config.roles?.implementer?.[tier] ?? []).map((worker: any) => projectRole(worker, `roles.implementer.${tier} args`))]));
 }
 
 function cleanHead(run: any, head = run.accepted_head) {
@@ -1614,6 +1634,8 @@ async function dispatchFinalAttempt(runPath: string, controller: string,
       const worker = initial ? config.reviewer : repair ? config.implementerTiers?.[decision.implementer_tier]?.[0] : config.verifier?.[decision.verifier_tier];
       if (!['codex', 'claude', 'opencode'].includes(worker?.kind)) throw new Error('Unsupported final reviewer');
       required(worker.model, 'reviewer.model'); strings(worker.args, 'reviewer.args');
+      // A retained implementer is prompted, not launched; its saved args are unused.
+      if (!retained) requireAuto(worker, 'reviewer.args');
       if (!initial && (await cleanupWorkers(path, controller, call)).pending.length) throw new Error('Pending worker cleanup');
       if (retained && (prior.worker_kind !== worker.kind || prior.model !== worker.model)) throw new Error('Retained implementer configuration changed');
       if (retained) ready((await call('agent', 'get', prior.worker_name)).agent, prior, tab);
@@ -1800,7 +1822,7 @@ export async function dispatchReview(runPath: string, controller: string, call: 
       cleanHead(run);
       const worker = config.reviewer ?? projectConfig(run.worktree_path).roles?.taskReviewer;
       if (!worker || !['codex', 'opencode', 'claude'].includes(worker.kind)) throw new Error('Supported reviewer configuration is required');
-      strings(worker.args, 'reviewer.args');
+      launchArgs(worker, 'reviewer.args');
       required(worker.model, 'reviewer.model');
       // Snapshot only the selected executable configuration, never project credentials.
       config.reviewer = roleSnapshot(worker);
@@ -2005,7 +2027,7 @@ export async function dispatchRepair(runPath: string, controller: string, call: 
     if (!worker || !['codex', 'opencode', 'claude'].includes(worker.kind)) throw new Error('Supported escalation worker required');
     config.worker = roleSnapshot(worker);
     if (escalate) {
-      strings(worker.args, 'escalation worker args');
+      launchArgs(worker, 'escalation worker args');
       required(worker.model, 'escalation worker model');
       const parent = (await call('pane', 'get', config.parentPane)).pane;
       if (parent?.pane_id !== config.parentPane || parent.tab_id !== config.tab) throw new Error('Repair parent identity mismatch');
@@ -2255,8 +2277,9 @@ export async function dispatchImplementation(runPath: string, controller: string
     const worker = config.roles?.implementer?.[run.tier]?.[0];
     if (!worker || !['codex', 'opencode', 'claude'].includes(worker.kind))
       throw new Error('Explicit codex/opencode/claude implementer configuration required');
-    strings(worker.args, 'worker.args');
+    launchArgs(worker, 'worker.args');
     required(worker.model, 'worker.model');
+    const reviewer = projectRole(config.roles?.taskReviewer, 'roles.taskReviewer args'), implementerTiers = tierSnapshot(config);
     const trailer = required(config.project?.commitTrailer, 'project.commitTrailer');
     const parent = (await call('pane', 'get', parentPane)).pane;
     if (parent?.pane_id !== parentPane || parent.tab_id !== tab)
@@ -2276,7 +2299,7 @@ export async function dispatchImplementation(runPath: string, controller: string
         .run('dispatching', JSON.stringify({ lastNoLaunchDecision: JSON.parse(run.config_json).lastNoLaunchDecision,
           ...placement, worker: roleSnapshot(worker), trailer, parentPane, tab,
           commitProvenance: config.project?.commitProvenance === true,
-          reviewer: roleSnapshot(config.roles?.taskReviewer), implementerTiers: tierSnapshot(config) }), now, run.id);
+          reviewer, implementerTiers }), now, run.id);
     }).immediate();
     attempted = true;
     mkdirSync(path, { recursive: true });

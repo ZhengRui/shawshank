@@ -1076,12 +1076,13 @@ test('dispatch and acceptance validate identity, provenance, and checks', async 
 
 function dispatchFixture(kind = 'codex', reviewerKind = 'codex', externalInputs = false, reviewerMetadata = {}) {
   const f = fixture(externalInputs);
+  const args = (role: string, model: string) => ['--model', model, ...(role === 'opencode' ? ['--auto'] : [])];
   mkdirSync(join(f.root, '.shawshank'));
   writeFileSync(join(f.root, '.shawshank/config.json'), JSON.stringify({
     roles: { reviewer: { kind: 'codex', model: 'final-review-only', args: ['--model', 'final-review-only'] },
-      taskReviewer: { kind: reviewerKind, model: 'review-fixture', args: ['--model', 'review-fixture'], ...reviewerMetadata },
-      implementer: { standard: [{ kind, model: 'fixture', args: ['--model', 'fixture'] }],
-        capable: [{ kind, model: 'capable-fixture', args: ['--model', 'capable-fixture'] }] } },
+      taskReviewer: { kind: reviewerKind, model: 'review-fixture', args: args(reviewerKind, 'review-fixture'), ...reviewerMetadata },
+      implementer: { standard: [{ kind, model: 'fixture', args: args(kind, 'fixture') }],
+        capable: [{ kind, model: 'capable-fixture', args: args(kind, 'capable-fixture') }] } },
     project: { commitTrailer: 'Co-Authored-By: Test <noreply@example.invalid>' },
   }));
   const commit = () => {
@@ -2046,6 +2047,32 @@ test('review dispatch preserves provider and effort without retaining unrelated 
   expect(saved()).not.toHaveProperty('privateNote');
 });
 
+test('OpenCode roles without --auto are rejected before any attempt is recorded', async () => {
+  const f = dispatchFixture('opencode');
+  writeFileSync(join(f.root, '.shawshank/config.local.json'), JSON.stringify({ roles: { implementer: {
+    standard: [{ kind: 'opencode', model: 'fixture', args: ['--model', 'fixture'] }] } } }));
+  // Keep the overlay out of Git exactly as project-local configuration is stored.
+  writeFileSync(join(f.root, '.git/info/exclude'), '.shawshank/config.local.json\n');
+  await expect(dispatchImplementation(f.registered.run, 'a', f.transport))
+    .rejects.toThrow('worker.args must include --auto for OpenCode workers');
+  const db = new Database(join(f.root, '.shawshank/runs/workflow.sqlite'), { readonly: true });
+  expect(db.query('SELECT count(*) AS n FROM attempts').get()).toEqual({ n: 0 });
+  expect(db.query('SELECT stage FROM runs').get()).toEqual({ stage: 'registered' });
+  db.close();
+});
+
+test('OpenCode roles snapshotted for later stages also require --auto', async () => {
+  const f = dispatchFixture('codex');
+  writeFileSync(join(f.root, '.shawshank/config.local.json'), JSON.stringify({ roles: {
+    taskReviewer: { kind: 'opencode', model: 'review-fixture', args: ['--model', 'review-fixture'] } } }));
+  writeFileSync(join(f.root, '.git/info/exclude'), '.shawshank/config.local.json\n');
+  await expect(dispatchImplementation(f.registered.run, 'a', f.transport))
+    .rejects.toThrow('roles.taskReviewer args must include --auto for OpenCode workers');
+  const db = new Database(join(f.root, '.shawshank/runs/workflow.sqlite'), { readonly: true });
+  expect(db.query('SELECT count(*) AS n FROM attempts').get()).toEqual({ n: 0 });
+  db.close();
+});
+
 test('task reviewer snapshot survives later role overrides', async () => {
   const f = await reviewFixture(false, 'codex', 'claude');
   writeFileSync(join(f.root, '.shawshank/config.local.json'), JSON.stringify({roles:{
@@ -2072,7 +2099,7 @@ for (const kind of ['claude', 'opencode']) {
         return f.reviewTransport(...args);
       };
       const review = await dispatchReview(f.registered.run, 'a', transport);
-      expect(starts[0]?.slice(starts[0].indexOf('--'))).toEqual(['--', '--model', 'review-fixture']);
+      expect(starts[0]?.slice(starts[0].indexOf('--'))).toEqual(['--', '--model', 'review-fixture', ...(reviewerKind === 'opencode' ? ['--auto'] : [])]);
       expect(starts[0]?.[starts[0].indexOf('--kind') + 1]).toBe(reviewerKind);
       writeFileSync(review.report, JSON.stringify({ attempt_id: review.attempt_id,
         base_sha: f.registered.base_sha, head_sha: f.head, evidence: 'Synthetic repair fixture.',
