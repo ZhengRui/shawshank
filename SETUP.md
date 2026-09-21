@@ -62,8 +62,10 @@ zsh/bash/sh/fish for the executable probe; unsupported shells fail before launch
 V2 requires Herdr's full-TUI lifecycle integration (tested with Herdr 0.9.1 and
 OpenCode 2.0.11); Mini is not a substitute. Install or upgrade only with authorization.
 Fix reported prerequisite mismatches explicitly; do not fall back to another transport.
-Account for [external-reference approval prompts](references/task-contract.md#external-reference-permissions)
-when placing inputs outside the worker repository.
+Always include `--auto` in every OpenCode role's args, including test and
+end-to-end fixture configurations; see
+[external-reference approval prompts](references/task-contract.md#external-reference-permissions)
+for what happens without it.
 
 ## 3. Adapt project settings
 
