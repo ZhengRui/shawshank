@@ -1,7 +1,7 @@
 import { test, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync, realpathSync, readFileSync, renameSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, realpathSync, readFileSync, renameSync } from 'node:fs';
 import { acceptImplementation, dispatchImplementation, dispatchReview, acceptReview, recordTriage, dispatchRepair, correctReport, cleanupWorkers, takeOver, replaceWorker, dispatchFinalReview, acceptFinalReview, recordFinalTriage, dispatchFinalWork, acceptFinalWork, completeFinalReview } from './workflow';
 import { HerdrError } from './herdr';
 import { startupError } from './startup';
@@ -328,7 +328,9 @@ test('final standard rejects omitted coverage, changed files and incomplete find
   const state = JSON.parse(cli('status', f.run).out);
   expect(JSON.parse(readFileSync(state.attempts[0].report_path, 'utf8')).coverage[0].status).toBe('NOT_RUN');
   const dispatch = readFileSync(state.attempts[0].dispatch_path, 'utf8');
-  expect(dispatch).toContain(join(import.meta.dir, '../references/final-reviewer.md').replace('/scripts/..', ''));
+  const instructions = dispatch.match(/Read and follow (.+) before work\./)![1];
+  expect(instructions.startsWith(join(f.root, '.shawshank/inputs/'))).toBe(true);
+  expect(readFileSync(instructions, 'utf8')).toBe(readFileSync(join(import.meta.dir, '../references/final-reviewer.md'), 'utf8'));
 });
 
 test('final scope permits approved existing files with or without a Git diff', async () => {
@@ -494,6 +496,57 @@ async function finalLoopFixture(findings: any[] = [{ id: 'F1', severity: 'major'
   };
   return { ...f, run, call, calls, panes, observe, triage, repair, verify };
 }
+
+for (const action of ['repair', 'verification'] as const) test(`final ${action} snapshot failure preserves the dispatch stage and budget for retry`, async () => {
+  const f = await finalLoopFixture();
+  f.triage([{ id: 'F1', action: 'fix', evidence: 'Synthetic confirmed finding' }]);
+  if (action === 'verification') {
+    await f.repair(1);
+    await acceptFinalWork(f.run, 'final-controller', 'repair', f.call);
+  }
+  const before = f.observe();
+  const role = action === 'repair' ? 'implementer.md' : 'final-verifier.md';
+  const id = createHash('sha256').update(`instructions:${role}`).digest('hex');
+  const incomplete = join(f.root, '.shawshank/inputs', before.run.id, id);
+  mkdirSync(incomplete, { recursive: true });
+  const calls = f.calls.length;
+  await expect(dispatchFinalWork(f.run, 'final-controller', action, f.call)).rejects.toThrow('Incomplete worker input snapshot');
+  const after = f.observe();
+  expect(after.run).toEqual(before.run);
+  expect(after.attempts).toEqual(before.attempts);
+  expect(f.calls.slice(calls).filter(args => ['start', 'prompt'].includes(args[1]))).toEqual([]);
+  renameSync(incomplete, join(f.run, `incomplete-${action}-evidence`));
+  const retry = await dispatchFinalWork(f.run, 'final-controller', action, f.call);
+  const resumed = f.observe();
+  expect(resumed.attempts.at(-1).id).toBe(retry.attempt_id);
+  expect(resumed.attempts.at(-1).status).toBe('submitted');
+  expect(resumed.run.repair_count).toBe(before.run.repair_count + (action === 'repair' ? 1 : 0));
+});
+
+test('final startup input verification leaves a resumable attempt without relaunch or another repair reservation', async () => {
+  const f = await finalLoopFixture();
+  f.triage([{ id: 'F1', action: 'fix', evidence: 'Synthetic confirmed finding' }]);
+  await expect(dispatchFinalWork(f.run, 'final-controller', 'repair', async (...args) => {
+    const result = await f.call(...args);
+    if (args[1] === 'start') throw new HerdrError('Fixture startup approval', 'agent_not_ready');
+    return result;
+  })).rejects.toThrow('startup approval');
+  const before = f.observe(), attempt = before.attempts.at(-1);
+  const instructions = readFileSync(attempt.dispatch_path, 'utf8').match(/Read and follow (.+) before work\./)![1];
+  const original = readFileSync(instructions);
+  chmodSync(instructions, 0o644); writeFileSync(instructions, 'Unapproved role edit');
+  const calls = f.calls.length;
+  await expect(dispatchFinalWork(f.run, 'final-controller', 'repair', f.call)).rejects.toThrow('snapshot changed');
+  expect(f.observe().run).toEqual(before.run);
+  expect(f.observe().attempts).toEqual(before.attempts);
+  expect(f.calls.slice(calls).filter(args => ['start', 'prompt'].includes(args[1]))).toEqual([]);
+  writeFileSync(instructions, original);
+  const resumed = await dispatchFinalWork(f.run, 'final-controller', 'repair', f.call);
+  expect(resumed.attempt_id).toBe(attempt.id);
+  expect(f.observe().run.repair_count).toBe(before.run.repair_count);
+  expect(f.calls.slice(calls).filter(args => args[1] === 'start')).toEqual([]);
+  expect(f.calls.slice(calls).filter(args => args[1] === 'prompt')).toHaveLength(1);
+});
 
 const replacementEvidence = { worker_stopped: true,
   worker_stop_evidence: 'Synthetic worker settled; all commands and background writers stopped.',
@@ -671,7 +724,9 @@ test('verifier coverage gaps survive passing finding results and require final H
   const state = f.observe();
   for (const [action, reference] of [['repair', 'implementer.md'], ['verification', 'final-verifier.md']]) {
     const dispatch = readFileSync(state.attempts.find((a: any) => a.action === action).dispatch_path, 'utf8');
-    expect(dispatch).toContain(join(import.meta.dir, '../references', reference));
+    const instructions = dispatch.match(/Read and follow (.+) before work\./)![1];
+    expect(instructions.startsWith(join(f.root, '.shawshank/inputs/'))).toBe(true);
+    expect(readFileSync(instructions, 'utf8')).toBe(readFileSync(join(import.meta.dir, '../references', reference), 'utf8'));
   }
 });
 
@@ -1108,6 +1163,124 @@ function dispatchFixture(kind = 'codex', reviewerKind = 'codex', externalInputs 
   };
   return { ...f, registered, commit, transport, prompts: () => prompts };
 }
+
+test('input tampering prevents startup continuation and acceptance without another prompt', async () => {
+  const f = dispatchFixture('codex', 'codex', true);
+  await expect(dispatchImplementation(f.registered.run, 'a', 'p1', 'test', async (...args) => {
+    const result = await f.transport(...args);
+    if (args[1] === 'start') throw new HerdrError('Fixture startup approval', 'agent_not_ready');
+    return result;
+  })).rejects.toThrow('startup approval');
+  const state = JSON.parse(cli('status', f.registered.run).out);
+  const dispatch = readFileSync(state.attempts[0].dispatch_path, 'utf8');
+  const brief = dispatch.match(/"brief": "([^"]+)"/)![1];
+  const original = readFileSync(brief);
+  chmodSync(brief, 0o644); writeFileSync(brief, 'Unapproved edit');
+  await expect(dispatchImplementation(f.registered.run, 'a', 'p1', 'test', f.transport)).rejects.toThrow('snapshot changed');
+  expect(f.prompts()).toBe(0);
+  const blocked = JSON.parse(cli('status', f.registered.run).out);
+  expect(blocked.run).toEqual(state.run);
+  expect(blocked.attempts).toEqual(state.attempts);
+  writeFileSync(brief, original);
+  const resumed = await dispatchImplementation(f.registered.run, 'a', 'p1', 'test', f.transport);
+  expect(resumed.attempt_id).toBe(state.attempts[0].id);
+  expect(f.prompts()).toBe(1);
+  // A separate submitted fixture exercises the acceptance gate, not replay.
+  const g = dispatchFixture('codex', 'codex', true);
+  await dispatchImplementation(g.registered.run, 'a', 'p1', 'test', g.transport);
+  const submitted = JSON.parse(cli('status', g.registered.run).out);
+  const local = readFileSync(submitted.attempts[0].dispatch_path, 'utf8').match(/"brief": "([^"]+)"/)![1];
+  chmodSync(local, 0o644); writeFileSync(local, 'Unapproved edit');
+  await expect(acceptImplementation(g.registered.run, 'a', g.transport)).rejects.toThrow('snapshot changed');
+  expect(JSON.parse(cli('status', g.registered.run).out).attempts[0].status).toBe('submitted');
+  expect(original.length).toBeGreaterThan(0);
+});
+
+test('correction input failures preserve the submitted attempt and correction budget', async () => {
+  const f = dispatchFixture('codex', 'codex', true);
+  const attempt = await dispatchImplementation(f.registered.run, 'a', 'p1', 'test', f.transport);
+  const before = JSON.parse(cli('status', f.registered.run).out);
+  const local = readFileSync(before.attempts[0].dispatch_path, 'utf8').match(/"brief": "([^"]+)"/)![1];
+  const original = readFileSync(local);
+  const decision = join(f.registered.run, 'correction-decision.json');
+  writeFileSync(decision, JSON.stringify({ attempt_id: attempt.attempt_id, evidence: 'Synthetic invalid report' }));
+  chmodSync(local, 0o644); writeFileSync(local, 'Unapproved edit');
+  await expect(correctReport(f.registered.run, 'a', 'implementation', decision, f.transport)).rejects.toThrow('snapshot changed');
+  const after = JSON.parse(cli('status', f.registered.run).out);
+  expect(after.run).toEqual(before.run); expect(after.attempts).toEqual(before.attempts);
+  expect(f.prompts()).toBe(1);
+  writeFileSync(local, original);
+  await correctReport(f.registered.run, 'a', 'implementation', decision, f.transport);
+  expect(f.prompts()).toBe(2);
+  expect(JSON.parse(cli('status', f.registered.run).out).attempts[0].correction_count).toBe(1);
+});
+
+test('registered brief drift after a failed preflight rejects instead of silently dispatching old bytes', async () => {
+  const f = dispatchFixture('codex', 'codex', true);
+  const source = join(f.input, '..', 'brief.md'), original = readFileSync(source);
+  await expect(dispatchImplementation(f.registered.run, 'a', 'p1', 'test', async () =>
+    ({ pane: { pane_id: 'wrong', tab_id: 'test' } }))).rejects.toThrow('Parent pane');
+  const before = JSON.parse(cli('status', f.registered.run).out);
+  expect(before.run.stage).toBe('registered'); expect(before.attempts).toEqual([]);
+  writeFileSync(source, 'Changed requirements after failed preflight');
+  await expect(dispatchImplementation(f.registered.run, 'a', 'p1', 'test', f.transport)).rejects.toThrow('Retained brief input changed');
+  expect(JSON.parse(cli('status', f.registered.run).out).run).toEqual(before.run);
+  expect(f.prompts()).toBe(0);
+  writeFileSync(source, original);
+  await dispatchImplementation(f.registered.run, 'a', 'p1', 'test', f.transport);
+  expect(f.prompts()).toBe(1);
+});
+
+test('registered brief drift during pane observation rejects before the claim', async () => {
+  const f = dispatchFixture('codex', 'codex', true);
+  await expect(dispatchImplementation(f.registered.run, 'a', 'p1', 'test', async (...args) => {
+    const result = await f.transport(...args);
+    if (args[0] === 'pane' && args[1] === 'get') writeFileSync(join(f.input, '..', 'brief.md'), 'Concurrent source change');
+    return result;
+  })).rejects.toThrow('Retained brief input changed');
+  const state = JSON.parse(cli('status', f.registered.run).out);
+  expect(state.run.stage).toBe('registered'); expect(state.attempts).toEqual([]);
+  expect(f.prompts()).toBe(0);
+});
+
+test('legacy implementation acceptance never snapshots a missing caller-owned brief', async () => {
+  const f = dispatchFixture('codex', 'codex', true);
+  const attempt = await dispatchImplementation(f.registered.run, 'a', 'p1', 'test', f.transport);
+  const state = JSON.parse(cli('status', f.registered.run).out);
+  const local = readFileSync(state.attempts[0].dispatch_path, 'utf8').match(/"brief": "([^"]+)"/)![1];
+  const source = join(f.input, '..', 'brief.md');
+  // Reconstruct a pre-snapshot dispatch; preserve removed fixture artifacts as evidence.
+  writeFileSync(state.attempts[0].dispatch_path, readFileSync(state.attempts[0].dispatch_path, 'utf8').replaceAll(local, source));
+  renameSync(join(f.registered.run, 'worker-inputs'), join(f.registered.run, 'pre-snapshot-inputs'));
+  renameSync(join(f.root, '.shawshank/inputs'), join(f.registered.run, 'pre-snapshot-copies'));
+  renameSync(source, join(f.registered.run, 'moved-brief.md'));
+  const exclude = join(f.root, '.git/info/exclude'); writeFileSync(exclude, '');
+  writeFileSync(join(f.root, 'sample.ts'), 'export const answer = 42;\n'); f.commit();
+  const head = JSON.parse(cli('status', f.registered.run).out).observed_head;
+  writeFileSync(attempt.report, JSON.stringify({ attempt_id: attempt.attempt_id, base_sha: f.registered.base_sha,
+    head_sha: head, status: 'DONE', concerns: [], checks: [{ requirement: f.task.acceptance[0], status: 'PASS',
+      evidence: { command: 'fixture assertion', result: 'passed' } }] }));
+  await acceptImplementation(f.registered.run, 'a', f.transport);
+  expect(readFileSync(exclude, 'utf8')).toBe('');
+  expect(existsSync(join(f.root, '.shawshank/inputs'))).toBe(false);
+  expect(existsSync(join(f.registered.run, 'worker-inputs'))).toBe(false);
+});
+
+test('implementation acceptance rejects add-then-untrack snapshots even within allowed scope', async () => {
+  const f = dispatchFixture('codex', 'codex', true);
+  f.task.allowedPaths.push('.shawshank/inputs');
+  writeFileSync(f.input, JSON.stringify(f.task));
+  const attempt = await dispatchImplementation(f.registered.run, 'a', 'p1', 'test', f.transport);
+  const state = JSON.parse(cli('status', f.registered.run).out);
+  const brief = readFileSync(state.attempts[0].dispatch_path, 'utf8').match(/"brief": "([^"]+)"/)![1];
+  f.git('add', '-f', brief); f.commit();
+  await expect(acceptImplementation(f.registered.run, 'a', f.transport)).rejects.toThrow('must not be tracked');
+  f.git('rm', '--cached', brief); f.commit();
+  const head = JSON.parse(cli('status', f.registered.run).out).observed_head;
+  writeFileSync(attempt.report, JSON.stringify({ attempt_id: attempt.attempt_id, base_sha: f.registered.base_sha,
+    head_sha: head, status: 'DONE', concerns: [], checks: [] }));
+  await expect(acceptImplementation(f.registered.run, 'a', f.transport)).rejects.toThrow('must not be tracked or committed');
+});
 
 function recoveryDecision(run: string, extra: any = {}) {
   const state = JSON.parse(cli('status', run).out);
@@ -2024,7 +2197,7 @@ async function reviewFixture(startupDecision = false, kind = 'codex', reviewerKi
 test('new runs snapshot the configured Claude Opus task reviewer, not the final reviewer', async () => {
   const f = dispatchFixture();
   const defaults = JSON.parse(readFileSync(join(import.meta.dir, '../configs/config.example.json'), 'utf8'));
-  writeFileSync(join(f.root, '.git/info/exclude'), '.shawshank/config.local.json\n');
+  appendFileSync(join(f.root, '.git/info/exclude'), '\n.shawshank/config.local.json\n');
   writeFileSync(join(f.root, '.shawshank/config.local.json'), JSON.stringify({roles:{
     taskReviewer:defaults.roles.taskReviewer,reviewer:{kind:'codex',model:'final-only-fixture',args:[]}
   }}));
@@ -2052,7 +2225,7 @@ test('task reviewer snapshot survives later role overrides', async () => {
     taskReviewer:{kind:'opencode',model:'changed',args:[]},reviewer:{kind:'codex',model:'final-only',args:[]}
   }}));
   // Keep the overlay out of Git exactly as project-local configuration is stored.
-  writeFileSync(join(f.root, '.git/info/exclude'), '.shawshank/config.local.json\n');
+  appendFileSync(join(f.root, '.git/info/exclude'), '\n.shawshank/config.local.json\n');
   const starts: string[][] = [];
   await dispatchReview(f.registered.run, 'a', async (...args) => {
     if (args[1] === 'start') starts.push(args);
@@ -2373,7 +2546,9 @@ test('repair count persists through three reused rounds, escalation, and highest
     const attempt = JSON.parse(cli('status', f.registered.run).out).attempts.at(-1);
     const briefPath = join(f.input, '..', 'brief.md');
     expect(existsSync(join(f.root, 'brief.md'))).toBe(false);
-    expect(readFileSync(attempt.dispatch_path, 'utf8')).toContain(briefPath);
+    const localBrief = readFileSync(attempt.dispatch_path, 'utf8').match(/^Approved brief: (.+)$/m)![1];
+    expect(localBrief.startsWith(join(f.root, '.shawshank/inputs/'))).toBe(true);
+    expect(readFileSync(localBrief, 'utf8')).toBe(readFileSync(briefPath, 'utf8'));
     expect(readFileSync(briefPath, 'utf8')).toContain('approved fixture change');
     expect(repair.repair_count).toBe(round);
     expect(repair.pane).toBe(round <= 3 ? 'p2' : 'p3');
