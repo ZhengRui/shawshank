@@ -1,21 +1,42 @@
 import { realpathSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { HerdrCall } from './herdr';
+import { waitFor, type Wait } from './startup';
 
-class ShellBusyError extends Error {}
+export class ShellBusyError extends Error {}
+export class UnsupportedShellError extends Error {}
+export type ShellPin = { terminal_id?: string; shell_pid?: number };
 
 // A reusable pane is explicitly assigned, never discovered by scanning user shells.
-export async function shellPane(call: HerdrCall, paneId: string, tab: string) {
+export async function shellPane(call: HerdrCall, paneId: string, tab: string, pin?: ShellPin) {
   const pane = (await call('pane', 'get', paneId)).pane;
   if (pane?.pane_id !== paneId || pane.tab_id !== tab) throw new Error('Reusable pane identity changed');
   if (pane.agent) throw new Error('Reusable pane is not an available shell');
   const info = (await call('pane', 'process-info', '--pane', paneId)).process_info;
   const processes = info?.foreground_processes;
+  if (pin) {
+    if ((pane.terminal_id && pin.terminal_id && pin.terminal_id !== pane.terminal_id) ||
+        (info?.shell_pid && pin.shell_pid && pin.shell_pid !== info.shell_pid)) throw new Error('Shell identity changed');
+    if (pane.terminal_id) pin.terminal_id = pane.terminal_id;
+    if (info?.shell_pid) pin.shell_pid = info.shell_pid;
+    if (!pane.terminal_id || !info?.shell_pid) throw new ShellBusyError('Shell identity is incomplete');
+  }
   if (info?.pane_id !== paneId || !info.shell_pid || !Array.isArray(processes) || processes.length !== 1 ||
-      processes[0].pid !== info.shell_pid || info.foreground_process_group_id !== info.shell_pid ||
-      !['zsh', 'bash', 'sh', 'fish'].includes(basename(processes[0].argv0 ?? '').replace(/^-/, '')))
-    throw new ShellBusyError('Reusable pane has a foreground command or unsupported shell');
+      processes[0].pid !== info.shell_pid || info.foreground_process_group_id !== info.shell_pid)
+    throw new ShellBusyError('Reusable pane has a foreground command');
+  const argv0 = processes[0].argv0;
+  if (typeof argv0 !== 'string' || !argv0.trim() || !basename(argv0).replace(/^-/, ''))
+    throw new ShellBusyError('Shell executable is incomplete');
+  if (!['zsh', 'bash', 'sh', 'fish'].includes(basename(argv0).replace(/^-/, '')))
+    throw new UnsupportedShellError(`Expected zsh/bash/sh/fish; observed ${argv0}`);
   return { pane, shell: processes[0] };
+}
+
+export function waitForShell(call: HerdrCall, paneId: string, tab: string, pin: ShellPin, wait?: Wait) {
+  return waitFor(async () => {
+    try { return await shellPane(call, paneId, tab, pin); }
+    catch (error) { if (!(error instanceof ShellBusyError)) throw error; }
+  }, 'Shell did not become ready; no worker started', wait);
 }
 
 export async function prepareShell(call: HerdrCall, paneId: string, tab: string, cwd: string,
@@ -32,7 +53,7 @@ export async function prepareShell(call: HerdrCall, paneId: string, tab: string,
     try { current = await shellPane(call, paneId, tab); }
     catch (error) {
       // Directory-change hooks can briefly own the foreground. Do not resend cd.
-      if (error instanceof ShellBusyError) continue;
+      if (error instanceof ShellBusyError || error instanceof UnsupportedShellError) continue;
       throw error;
     }
     if (current.pane.terminal_id !== before.pane.terminal_id || current.shell.pid !== before.shell.pid)
@@ -85,7 +106,7 @@ export async function returnToShell(call: HerdrCall, attempt: any, config: any,
       } catch (error) {
         // Agent detection can clear before process teardown or prompt hooks end.
         // Spend the existing bounded wait budget, without sending more input.
-        if (!(error instanceof ShellBusyError)) throw error;
+        if (!(error instanceof ShellBusyError || error instanceof UnsupportedShellError)) throw error;
       }
     }
   }

@@ -30,11 +30,74 @@ a coarse `prepared` record requires an explicit
 non-submission, not infer it from idle state. A `prompting` attempt cannot replay.
 This records operator reconciliation, not automatic proof of non-delivery.
 
-If OpenCode startup stops before task input because its UI did not appear,
+If OpenCode V1 startup stops before task input because its UI did not appear,
 inspect the original pane. Once its input UI is visible, wait three seconds and
 continue the same startup_blocked dispatch; do not create another worker. The
 automatic check recognizes the standard TUI's "Ask anything" input placeholder;
-custom or minimal UIs require inspection rather than assuming readiness.
+custom UIs require inspection rather than assuming readiness.
+
+For OpenCode V2, inspect the retained session ID from the startup diagnostic and
+the original pane. Error phase `prelaunch` means no session creation was attempted;
+`session-create` or `session-start` requires inspection of possible retained state.
+Original error codes and causes are diagnostic evidence, not retry permission.
+V2 does not enter the legacy `startup_blocked` shortcut even for `agent_not_ready`.
+Before explicitly reconciling an unprompted attempt, verify the exact
+full-TUI lifecycle session, worker identity, directory and explicit selections
+against the saved role using `opencode api session.get --param sessionID=<id>`.
+An API timeout can leave an unreported empty session: inspect before creating
+another. Do not switch to Mini, reuse an unrelated session, or relax model/hook
+checks to make startup pass. A settled screen alone is insufficient.
+Task `not_submitted` reconciliation (or implementation `--startup-decision`)
+does not programmatically repeat V2 hook/session validation: the operator must
+perform the checks above before using it. Final runs have no live-session V2
+startup reconciliation path. If bounded startup verification fails with a live
+agent, preserve the session and stop for user judgment; `resolve-no-launch`
+cannot release a live worker and must not be used to bypass these checks.
+For an uncertain executable-probe receipt, inspect the original shell and retained
+receipt first; do not rerun the probe while it might still be executing.
+
+### Confirmed no-launch attempt
+
+For a `prepared` attempt in task implementation/review/repair or final
+review/repair/verification dispatch, the current owner can use:
+
+```sh
+bun <skill>/scripts/workflow.ts resolve-no-launch <run> --controller <current-id> --decision <file>
+```
+
+Use this only after the failed command and any shell probe have stopped. Include
+the standard recovery fields below (`previous_controller`, `stage`, `attempt_id`,
+`previous_command_stopped`, `evidence`, `session_evidence`, `head_sha`,
+`worktree_fingerprint`), plus `resolution: "no_launch"`, `prompt_submitted: false`,
+concrete `non_submission_evidence`, `no_agent_evidence`, and
+`session_creation_evidence`. Establish either `no_session_created: true`, or
+the exact `session_id` with `session_unused: true` and evidence that it has no
+messages/execution. The known-unused-session branch is supported only for OpenCode;
+other worker kinds require `no_session_created: true`.
+Unknown session creation is not sufficient. These are positive
+operator assertions, not facts inferred from idle state or missing receipts.
+
+No-launch rollback requires the stage's clean baseline and rejects replacement
+continuations even if clean. A failed-prelaunch replacement still in `prepared`
+can use another `replace-worker` with fresh stop/partial-work evidence, preserving
+its continuation and budgets. First confirm its unused split pane absent (close
+only after inspection), or verify the assigned reusable shell; do not discard
+partial commits or dirty files to qualify for no-launch rollback.
+
+The command requires the named agent to return `agent_not_found`. A split pane
+must already be confirmed absent: inspect and close only the positively identified
+unused owned pane before recovery. An authorized reusable pane may remain as a
+verified shell in the worktree, with no agent. If no pane was recorded, also supply
+`no_pane_created: true` and `no_pane_evidence`. Transport errors are not absence.
+Never close a live or uncertain worker to manufacture no-launch evidence.
+
+Recovery saves the decision, marks the old attempt `no_launch`, releases its
+cleanup claim, and returns to the prior ready stage. Any unused repair reservation
+and task escalation are restored. It preserves dispatch/report artifacts and
+sends no launch or prompt. A subsequent explicit normal dispatch creates a fresh
+attempt; it does not replay the abandoned one. This command neither transfers
+ownership nor reconciles `prompting`/submitted work or a live V2 session. Those
+remain under the existing recovery rules and final-run limits.
 
 If the retained reviewer is unavailable or its identity changes, dispatch stops
 without sending the prompt or silently launching another reviewer. Inspect the
@@ -196,7 +259,8 @@ stop for another explicit decision rather than retrying blindly.
 Final-run takeover and worker replacement are not implemented. Do not apply task
 recovery commands or adopt the old controller ID. Stop for an interrupted owner
 or ambiguous execution and report the saved/live evidence. Same-owner normal
-transitions and explicit report/commit-message correction remain available.
+transitions, confirmed no-launch recovery above, and explicit report/commit-message
+correction remain available.
 
 ### Initial report after worker exit
 

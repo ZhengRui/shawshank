@@ -3,7 +3,8 @@ import { existsSync, lstatSync, readlinkSync, mkdirSync, readFileSync, realpathS
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { herdr, HerdrError, type HerdrCall } from './herdr';
+import { herdr, HerdrError, startupBlocked, type HerdrCall } from './herdr';
+import { isOpenCodeSessionID } from './opencode';
 import { provenanceInstructions, validateProvenance, retainedRole } from './commit-provenance';
 import { allocatePane, prepareShell, returnToShell, shellPane } from './feature-pane';
 
@@ -705,14 +706,24 @@ function recoverySnapshot(db: Database, run: any) {
     attempts: db.query('SELECT * FROM attempts WHERE run_id=? ORDER BY rowid').all(run.id) });
 }
 
-function startupWorktree(run: any, attempt: any) {
+function replacementDecision(run: any) {
   const config = JSON.parse(run.config_json);
-  const replacement = config.lastReplacementDecision ? JSON.parse(readFileSync(config.lastReplacementDecision,'utf8')) : null;
+  return config.lastReplacementDecision ? JSON.parse(readFileSync(config.lastReplacementDecision,'utf8')) : null;
+}
+
+function startupWorktree(run: any, attempt: any) {
+  const replacement = replacementDecision(run);
   if (replacement?.replacement_attempt_id === attempt.id) {
     if (replacement.head_sha !== git(run.worktree_path,'rev-parse','HEAD') ||
       replacement.worktree_fingerprint !== worktreeFingerprint(run.worktree_path))
       throw new Error('Partial work changed during replacement startup');
   } else cleanHead(run,attempt.action === 'implementation' ? run.base_sha : run.accepted_head);
+}
+
+function noLaunchWorktree(run: any, attempt: any) {
+  if (replacementDecision(run)?.replacement_attempt_id === attempt.id)
+    throw new Error('Replacement continuation requires replace-worker recovery, not no-launch rollback');
+  cleanHead(run, attempt.action === 'implementation' ? run.base_sha : run.accepted_head);
 }
 
 async function recoveryAgent(run: any, attempt: any, call: HerdrCall) {
@@ -728,6 +739,75 @@ async function recoveryAgent(run: any, attempt: any, call: HerdrCall) {
 
 // Recovery records operator evidence. It cannot infer prompt delivery or process
 // death from idle state, nor fence arbitrary commands outside this program.
+export async function resolveNoLaunch(runPath: string, controller: string, decisionFile: string, call: HerdrCall = herdr) {
+  const { path, db, run } = openRun(runPath, 'either');
+  try {
+    owned(db, run.id, controller, run.stage, true);
+    const stages: Record<string, string> = { dispatching: 'registered', review_dispatching: 'implementation_accepted',
+      repair_dispatching: 'repair_required', final_dispatching: 'final_ready',
+      final_repair_dispatching: 'final_repair_ready', final_verification_dispatching: 'final_verification_ready' };
+    const stage = stages[run.stage];
+    const attempt = db.query('SELECT * FROM attempts WHERE run_id=? ORDER BY rowid DESC LIMIT 1').get(run.id) as any;
+    const decision = recoveryInput(decisionFile, run);
+    if (!stage || attempt?.status !== 'prepared' || decision.attempt_id !== attempt.id || decision.resolution !== 'no_launch')
+      throw new Error('No prepared dispatch matches the no-launch decision');
+    noLaunchWorktree(run, attempt);
+    if (decision.prompt_submitted !== false) throw new Error('Positive non-submission evidence required');
+    required(decision.non_submission_evidence, 'positive non-submission evidence');
+    required(decision.no_agent_evidence, 'no agent evidence');
+    required(decision.session_creation_evidence, 'session creation evidence');
+    if (decision.no_session_created === true && (decision.session_id != null || decision.session_unused != null))
+      throw new Error('Conflicting session creation evidence');
+    if (decision.no_session_created !== true &&
+        !(attempt.worker_kind === 'opencode' && isOpenCodeSessionID(decision.session_id) && decision.session_unused === true))
+      throw new Error('Establish no session created or identify the unused session');
+    const before = recoverySnapshot(db, run);
+    try {
+      await call('agent', 'get', attempt.worker_name);
+      throw new Error('Worker still exists; no-launch recovery refused');
+    } catch (error) {
+      if (!(error instanceof HerdrError && error.code === 'agent_not_found')) throw error;
+    }
+    const config = JSON.parse(run.config_json);
+    if (!attempt.pane_id) {
+      if (decision.no_pane_created !== true) throw new Error('Missing pane receipt requires no_pane_created');
+      required(decision.no_pane_evidence, 'no pane evidence');
+    } else {
+      try {
+        const pane = (await call('pane', 'get', attempt.pane_id)).pane;
+        if (pane?.pane_id !== attempt.pane_id || pane.tab_id !== config.tab || pane.agent)
+          throw new Error('Pane identity or absence of agent is not confirmed');
+        if (!config.reusePane || attempt.pane_id !== config.parentPane || attempt.pane_id === config.controllerPane)
+          throw new Error('Close the confirmed unused split pane before releasing its attempt');
+        const shell = await shellPane(call, attempt.pane_id, config.tab);
+        if (realpathSync(shell.shell.cwd) !== run.worktree_path) throw new Error('Reusable shell directory changed');
+      } catch (error) {
+        if (!(error instanceof HerdrError && error.code === 'pane_not_found')) throw error;
+      }
+    }
+    db.transaction(() => {
+      owned(db, run.id, controller, run.stage, true);
+      if (recoverySnapshot(db, run) !== before || JSON.stringify(recoveryInput(decisionFile, run)) !== JSON.stringify(decision))
+        throw new Error('Recovery evidence changed; re-inspect');
+      noLaunchWorktree(run, attempt);
+      mkdirSync(path, { recursive: true });
+      const saved = join(path, `no-launch-${randomUUID()}.json`);
+      writeFileSync(saved, JSON.stringify(decision, null, 2), { flag: 'wx' });
+      config.lastNoLaunchDecision = saved;
+      const repair = ['repair_dispatching', 'final_repair_dispatching'].includes(run.stage);
+      const count = run.repair_count - (repair ? 1 : 0);
+      const tier = run.stage === 'repair_dispatching' && count > 0 && count % 3 === 0
+        ? ['cheap', 'standard', 'capable'][['cheap', 'standard', 'capable'].indexOf(run.tier) - 1] : run.tier;
+      if (count < 0 || !tier) throw new Error('Invalid repair reservation');
+      db.query("UPDATE attempts SET status='no_launch',cleanup_state='closed',finished_at=? WHERE id=?")
+        .run(new Date().toISOString(), attempt.id);
+      db.query('UPDATE runs SET stage=?,repair_count=?,tier=?,blocked_reason=NULL,config_json=?,updated_at=? WHERE id=?')
+        .run(stage, count, tier, JSON.stringify(config), new Date().toISOString(), run.id);
+    }).immediate();
+    return { run: path, stage, attempt_id: attempt.id, resolution: 'no_launch' };
+  } finally { db.close(); }
+}
+
 export async function takeOver(runPath: string, controller: string, decisionFile: string, call: HerdrCall = herdr) {
   const { path, db, run } = openRun(runPath);
   try {
@@ -774,7 +854,7 @@ export async function takeOver(runPath: string, controller: string, decisionFile
       blocked = null;
     } else if (decision.resolution === 'retain') {
       if (dispatching) throw new Error('Outstanding dispatch requires explicit reconciliation or unresolved');
-      if (latest && !['submitted','accepted','replaced','correction_ready'].includes(latest.status))
+      if (latest && !['submitted','accepted','replaced','no_launch','correction_ready'].includes(latest.status))
         throw new Error('Outstanding correction requires explicit reconciliation');
       for (const attempt of attempts.filter(a => a.status === 'submitted')) await recoveryAgent(run, attempt, call);
       if (latest?.status === 'correction_ready') {
@@ -982,7 +1062,7 @@ export async function replaceWorker(runPath: string, controller: string, decisio
     try {
       ready((await call('agent','start',name,'--kind',worker.kind,'--pane',pane.pane_id,'--timeout','30000','--',...worker.args)).agent,attempt,config.tab);
     } catch (error) {
-      if (error instanceof HerdrError && error.code === 'agent_not_ready') db.transaction(() => {
+      if (startupBlocked(error)) db.transaction(() => {
         owned(db,run.id,controller,stage); db.query("UPDATE attempts SET status='startup_blocked' WHERE id=?").run(id);
       }).immediate();
       throw error;
@@ -1546,7 +1626,7 @@ async function dispatchFinalAttempt(runPath: string, controller: string,
         ready((await call('agent', 'start', attempt.worker_name, '--kind', worker.kind, '--pane', pane.pane_id,
           '--timeout', '30000', '--', ...worker.args)).agent, attempt, tab);
       } catch (error) {
-        if (error instanceof HerdrError && error.code === 'agent_not_ready')
+        if (startupBlocked(error))
           saveAttempt(db, run, controller, dispatching, "UPDATE attempts SET status='startup_blocked' WHERE id=?", id);
         throw error;
       }
@@ -1748,7 +1828,7 @@ export async function dispatchReview(runPath: string, controller: string, call: 
         ready((await call('agent', 'start', attempt.worker_name, '--kind', worker.kind, '--pane', pane.pane_id,
           '--timeout', '30000', '--', ...worker.args)).agent, attempt, config.tab);
       } catch (error) {
-        if (error instanceof HerdrError && error.code === 'agent_not_ready')
+        if (startupBlocked(error))
           saveAttempt(db,run,controller,'review_dispatching',"UPDATE attempts SET status='startup_blocked' WHERE id=?",id);
         throw error;
       }
@@ -1937,7 +2017,7 @@ export async function dispatchRepair(runPath: string, controller: string, call: 
           '--timeout', '30000', '--', ...worker.args)).agent,
         { worker_name: name, pane_id: paneId, worker_kind: worker.kind }, config.tab);
       } catch (error) {
-        if (error instanceof HerdrError && error.code === 'agent_not_ready')
+        if (startupBlocked(error))
           saveAttempt(db,run,controller,'repair_dispatching',"UPDATE attempts SET status='startup_blocked' WHERE id=?",id);
         throw error;
       }
@@ -2122,6 +2202,14 @@ export async function dispatchImplementation(runPath: string, controller: string
     owned(db, run.id, controller, 'registered');
     if (dirty(run.worktree_path) || git(run.worktree_path, 'rev-parse', 'HEAD') !== run.base_sha)
       throw new Error('Worktree changed since registration');
+    const task = JSON.parse(readFileSync(run.task_path, 'utf8'));
+    const taskSnapshot = join(path, 'task.json');
+    const checkTaskSnapshot = () => {
+      if (existsSync(taskSnapshot) && !isDeepStrictEqual(JSON.parse(readFileSync(taskSnapshot, 'utf8')), task))
+        throw new Error('Retained task input changed');
+    };
+    checkTaskSnapshot();
+    const brief = readFileSync(resolve(dirname(run.task_path), task.brief), 'utf8');
     const config = projectConfig(run.worktree_path);
     const placement = reusePane ? { reusePane: true, controllerPane: required(process.env.HERDR_PANE_ID, 'verified controller pane') } : {};
     if (reusePane) await prepareShell(call, parentPane, tab, run.worktree_path, placement.controllerPane!);
@@ -2134,14 +2222,13 @@ export async function dispatchImplementation(runPath: string, controller: string
     const parent = (await call('pane', 'get', parentPane)).pane;
     if (parent?.pane_id !== parentPane || parent.tab_id !== tab)
       throw new Error('Parent pane does not belong to the explicitly allowed tab');
-    const task = JSON.parse(readFileSync(run.task_path, 'utf8'));
-    const brief = readFileSync(resolve(dirname(run.task_path), task.brief), 'utf8');
     const id = randomUUID();
     const name = `aw-${id.slice(0, 20)}`;
     const dispatch = join(path, `${id}-dispatch.md`);
     const report = join(path, `${id}-report.json`);
     db.transaction(() => {
       owned(db, run.id, controller, 'registered');
+      checkTaskSnapshot();
       const now = new Date().toISOString();
       db.query(`INSERT INTO attempts (id,run_id,action,status,worker_kind,model,worker_name,
         dispatch_path,report_path,base_sha,started_at) VALUES (?,?,'implementation','prepared',?,?,?,?,?,?,?)`)
@@ -2153,7 +2240,7 @@ export async function dispatchImplementation(runPath: string, controller: string
     }).immediate();
     attempted = true;
     mkdirSync(path, { recursive: true });
-    writeFileSync(join(path, 'task.json'), JSON.stringify(task, null, 2), { flag: 'wx' });
+    if (!existsSync(taskSnapshot)) writeFileSync(taskSnapshot, JSON.stringify(task, null, 2), { flag: 'wx' });
     writeFileSync(dispatch, `# Implement one approved task\n\nWork only in ${run.worktree_path}.\n` +
       `No subagents, review, push, pane control, or unrelated changes. Implement, test, and commit.\n` +
       `Commit trailer: ${trailer}\nTask input:\n\n${JSON.stringify(task, null, 2)}\n\nBrief:\n${brief}\n\n` +
@@ -2171,7 +2258,7 @@ export async function dispatchImplementation(runPath: string, controller: string
       started = (await call('agent', 'start', name, '--kind', worker.kind, '--pane', pane.pane_id,
         '--timeout', '30000', '--', ...worker.args)).agent;
     } catch (error) {
-      if (error instanceof HerdrError && error.code === 'agent_not_ready')
+      if (startupBlocked(error))
         saveAttempt(db,run,controller,'dispatching','UPDATE attempts SET status=? WHERE id=?','startup_blocked',id);
       throw error;
     }
@@ -2288,6 +2375,8 @@ if (import.meta.main) {
       console.log(JSON.stringify(await (command.startsWith('dispatch') ? dispatchFinalWork : acceptFinalWork)(path, controller, command.endsWith('repair') ? 'repair' : 'verification'), null, 2));
     else if (command === 'status' && path && !flag)
       console.log(JSON.stringify(status(path), null, 2));
+    else if (command === 'resolve-no-launch' && path && flag === '--controller' && controller && extra.length === 2 && extra[0] === '--decision')
+      console.log(JSON.stringify(await resolveNoLaunch(path, controller, extra[1]), null, 2));
     else if (['take-over','replace-worker'].includes(command!) && path && flag === '--controller' && controller &&
       extra.length === 2 && extra[0] === '--decision')
       console.log(JSON.stringify(await (command === 'take-over' ? takeOver : replaceWorker)(path,controller,extra[1]),null,2));

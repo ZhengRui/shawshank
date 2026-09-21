@@ -100,6 +100,21 @@ test('directory hooks may finish before shell verification without repeating cd'
   expect(f.calls.filter(c => c[1] === 'run')).toHaveLength(1);
 });
 
+test('prepareShell retries an unlisted shell observation after cd without resending', async () => {
+  const f = fixture();
+  let afterCd = false, observations = 0;
+  const call = async (...args: string[]) => {
+    const result = await f.call(...args);
+    if (args[1] === 'run') afterCd = true;
+    if (args[1] === 'process-info' && afterCd && ++observations === 1)
+      result.process_info.foreground_processes[0].argv0 = 'nu';
+    return result;
+  };
+  await prepareShell(call, 'root', 'tab', '.', 'controller', async () => {});
+  expect(observations).toBe(2);
+  expect(f.calls.filter(c => c[1] === 'run')).toHaveLength(1);
+});
+
 test('exit waits for transient shell work but remains bounded without resending', async () => {
   for (const busyPolls of [2, 100]) {
     const f = fixture(); f.agent('opencode');
@@ -131,4 +146,20 @@ test('exit stops immediately when the pane changes during its wait', async () =>
   await expect(returnToShell(call,{pane_id:'root',worker_name:'worker',worker_kind:'opencode'},
     {reusePane:true,parentPane:'root',controllerPane:'controller',tab:'tab'},async()=>{})).rejects.toThrow('changed during exit');
   expect(f.calls.filter(c=>c[1]==='prompt')).toHaveLength(1);
+});
+
+test('non-OpenCode cleanup retries incomplete or unlisted argv0 without resending exit', async () => {
+  for (const argv0 of [undefined, '', '-', 'nu']) {
+    const f = fixture(); f.agent('codex');
+    let reads = 0;
+    const call = async (...args: string[]) => {
+      const result = await f.call(...args);
+      if (args[1] === 'process-info' && ++reads === 1) result.process_info.foreground_processes[0].argv0 = argv0;
+      return result;
+    };
+    await returnToShell(call, { pane_id: 'root', worker_name: 'worker', worker_kind: 'codex' },
+      { reusePane: true, parentPane: 'root', controllerPane: 'controller', tab: 'tab' }, async () => {});
+    expect(reads).toBe(2);
+    expect(f.calls.filter(c => c[1] === 'prompt')).toHaveLength(1);
+  }
 });

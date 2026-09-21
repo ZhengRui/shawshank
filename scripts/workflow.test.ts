@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync, realpathSync, readFileSync } from 'node:fs';
 import { acceptImplementation, dispatchImplementation, dispatchReview, acceptReview, recordTriage, dispatchRepair, correctReport, cleanupWorkers, takeOver, replaceWorker, dispatchFinalReview, acceptFinalReview, recordFinalTriage, dispatchFinalWork, acceptFinalWork, completeFinalReview } from './workflow';
 import { HerdrError } from './herdr';
+import { startupError } from './startup';
+import { resolveNoLaunch } from './workflow';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -1035,6 +1037,272 @@ function recoveryDecision(run: string, extra: any = {}) {
   return file;
 }
 
+const noLaunchEvidence = { resolution: 'no_launch', prompt_submitted: false,
+  non_submission_evidence: 'Fixture transport rejected before prompt.', no_agent_evidence: 'Named worker absent; unused pane closed.',
+  no_session_created: true, session_creation_evidence: 'Fixture prelaunch rejection; session.create never called.' };
+const absentLaunch = async (...args: string[]) => {
+  if (args[1] !== 'get') throw new Error('Recovery must be read-only');
+  throw new HerdrError('Fixture absent', args[0] === 'agent' ? 'agent_not_found' : 'pane_not_found');
+};
+
+test('no-launch recovery releases task startup without replay and permits a fresh dispatch', async () => {
+  const f = dispatchFixture('opencode');
+  await expect(dispatchImplementation(f.registered.run, 'a', 'root', 'test', async (...args) => {
+    if (args[1] === 'start') throw startupError(new Error('probe rejected'), 'prelaunch');
+    return f.transport(...args);
+  })).rejects.toThrow('pre-launch');
+  const decide = (extra = {}) => recoveryDecision(f.registered.run, { ...noLaunchEvidence, ...extra });
+  for (const extra of [{ prompt_submitted: true }, { no_session_created: false }, { no_agent_evidence: '' },
+    { session_creation_evidence: '' }, { session_id: 'ses_conflict', session_unused: true }, { attempt_id: 'stale' }])
+    await expect(resolveNoLaunch(f.registered.run, 'a', decide(extra), absentLaunch)).rejects.toThrow();
+  await expect(resolveNoLaunch(f.registered.run, 'other', decide(), absentLaunch)).rejects.toThrow();
+  await expect(resolveNoLaunch(f.registered.run, 'a', decide(), async () => ({ agent: { agent_status: 'idle' } }))).rejects.toThrow('still exists');
+  await expect(resolveNoLaunch(f.registered.run, 'a', decide(), async () => { throw new Error('transport failure'); })).rejects.toThrow('transport failure');
+  const original = JSON.parse(cli('status', f.registered.run).out).attempts[0];
+  const dispatch = readFileSync(original.dispatch_path, 'utf8');
+  const result = await resolveNoLaunch(f.registered.run, 'a', decide(), absentLaunch);
+  expect(result.stage).toBe('registered');
+  expect(f.prompts()).toBe(0);
+  expect(readFileSync(original.dispatch_path, 'utf8')).toBe(dispatch);
+  await dispatchImplementation(f.registered.run, 'a', 'root', 'test', f.transport);
+  const state = JSON.parse(cli('status', f.registered.run).out);
+  expect(state.attempts.map((a: any) => a.status)).toEqual(['no_launch', 'submitted']);
+  expect(f.prompts()).toBe(1);
+  await expect(resolveNoLaunch(f.registered.run, 'a', decide(), absentLaunch)).rejects.toThrow('No prepared dispatch');
+});
+
+test('no-launch creates missing run directory after the prepared-record crash window', async () => {
+  const f = dispatchFixture('opencode');
+  const run = f.registered.run;
+  expect(existsSync(run)).toBe(false);
+  const db = new Database(join(f.root, '.shawshank/runs/workflow.sqlite'));
+  const saved = db.query('SELECT * FROM runs').get() as any;
+  // Model the committed dispatch intent before its first filesystem write.
+  db.query(`INSERT INTO attempts(id,run_id,action,status,worker_kind,worker_name,dispatch_path,report_path,base_sha,started_at)
+    VALUES ('crash-attempt',?,'implementation','prepared','opencode','crash-worker',?,?,?,?)`)
+    .run(saved.id, join(run, 'dispatch.md'), join(run, 'report.json'), saved.base_sha, new Date().toISOString());
+  db.query("UPDATE runs SET stage='dispatching'").run();
+  db.close();
+  const state = JSON.parse(cli('status', run).out);
+  const external = mkdtempSync(join(tmpdir(), 'no-launch-decision-'));
+  const decision = join(external, 'decision.json');
+  writeFileSync(decision, JSON.stringify({ ...noLaunchEvidence, previous_controller: 'a', stage: 'dispatching',
+    attempt_id: 'crash-attempt', previous_command_stopped: true, evidence: 'Simulated crash after intent commit.',
+    session_evidence: 'Same isolated fixture session.', head_sha: state.observed_head,
+    worktree_fingerprint: state.worktree_fingerprint, no_pane_created: true, no_pane_evidence: 'No transport calls occurred.' }));
+  expect(existsSync(run)).toBe(false);
+  expect((await resolveNoLaunch(run, 'a', decision, absentLaunch)).stage).toBe('registered');
+  const after = JSON.parse(cli('status', run).out);
+  const retained = JSON.parse(after.run.config_json).lastNoLaunchDecision;
+  expect(JSON.parse(readFileSync(retained, 'utf8'))).toEqual(JSON.parse(readFileSync(decision, 'utf8')));
+  expect(after.attempts[0].status).toBe('no_launch');
+  await dispatchImplementation(run, 'a', 'root', 'test', f.transport);
+  expect(f.prompts()).toBe(1);
+});
+
+test('retained task mismatch rejects before recording a new dispatch, including transaction-time drift', async () => {
+  for (const duringCheck of [false, true]) {
+    const f = dispatchFixture('opencode');
+    await expect(dispatchImplementation(f.registered.run, 'a', 'root', 'test', async (...args) => {
+      if (args[1] === 'start') throw startupError(new Error('probe'), 'prelaunch');
+      return f.transport(...args);
+    })).rejects.toThrow();
+    await resolveNoLaunch(f.registered.run, 'a', recoveryDecision(f.registered.run, noLaunchEvidence), absentLaunch);
+    const snapshot = join(f.registered.run, 'task.json');
+    const change = () => writeFileSync(snapshot, JSON.stringify({ ...f.task, goal: 'Different retained contract' }));
+    const before = JSON.parse(cli('status', f.registered.run).out);
+    if (!duringCheck) change();
+    let calls = 0;
+    await expect(dispatchImplementation(f.registered.run, 'a', 'root', 'test', async (...args) => {
+      calls++;
+      if (duringCheck && args[0] === 'pane' && args[1] === 'get') change();
+      return f.transport(...args);
+    })).rejects.toThrow('Retained task input changed');
+    const after = JSON.parse(cli('status', f.registered.run).out);
+    expect(after.run).toEqual(before.run);
+    expect(after.attempts).toEqual(before.attempts);
+    expect(calls).toBe(duringCheck ? 1 : 0);
+    expect(f.prompts()).toBe(0);
+  }
+});
+
+test('no-launch rejects non-baseline work before observation and work changed during observation', async () => {
+  for (const mode of ['dirty', 'commit', 'during']) {
+    const f = dispatchFixture('opencode');
+    await expect(dispatchImplementation(f.registered.run, 'a', 'root', 'test', async (...args) => {
+      if (args[1] === 'start') throw startupError(new Error('probe'), 'prelaunch');
+      return f.transport(...args);
+    })).rejects.toThrow();
+    const change = () => writeFileSync(join(f.root, 'partial.txt'), 'Preserve partial work');
+    if (mode !== 'during') change();
+    if (mode === 'commit') f.commit();
+    const before = JSON.parse(cli('status', f.registered.run).out);
+    let calls = 0;
+    await expect(resolveNoLaunch(f.registered.run, 'a', recoveryDecision(f.registered.run, noLaunchEvidence), async (...args) => {
+      calls++;
+      if (mode === 'during') change();
+      return absentLaunch(...args);
+    })).rejects.toThrow();
+    const after = JSON.parse(cli('status', f.registered.run).out);
+    expect(after.run).toEqual(before.run);
+    expect(after.attempts).toEqual(before.attempts);
+    expect(readFileSync(join(f.root, 'partial.txt'), 'utf8')).toBe('Preserve partial work');
+    if (mode !== 'during') expect(calls).toBe(0);
+  }
+});
+
+test('failed-prelaunch replacement rejects rollback but another replacement preserves continuation', async () => {
+  for (const mode of ['clean', 'partial', 'repair']) {
+    const f = dispatchFixture('opencode');
+    await dispatchImplementation(f.registered.run, 'a', 'p1', 'test', f.transport);
+    if (mode !== 'clean') {
+      writeFileSync(join(f.root, 'sample.ts'), 'export const answer = 41;\n'); f.commit();
+      writeFileSync(join(f.root, 'sample.ts'), 'export const answer = 42;\n');
+      writeFileSync(join(f.root, 'partial.txt'), 'Preserve notes');
+    }
+    if (mode === 'repair') {
+      const db = new Database(join(f.root, '.shawshank/runs/workflow.sqlite'));
+      db.query("UPDATE runs SET repair_count=4,tier='capable'").run();
+      db.query("UPDATE attempts SET action='repair',correction_count=1").run();
+      db.close();
+    }
+    const before = JSON.parse(cli('status', f.registered.run).out);
+    const closed = new Set<string>();
+    let split = 2, starts = 0, prompts = 0;
+    let agent: any;
+    const call = async (...args: string[]) => {
+      if (args[0] === 'pane') {
+        if (args[1] === 'close') { closed.add(args[2]); return { type: 'ok' }; }
+        if (args[1] === 'get' && closed.has(args[2])) throw new HerdrError('Absent pane', 'pane_not_found');
+        if (args[1] === 'split') return { pane: { pane_id: `p${++split}`, tab_id: 'test' } };
+      }
+      if (args[1] === 'start') {
+        if (++starts === 1) throw startupError(new Error('fixture probe rejected'), 'prelaunch');
+        agent = { name: args[2], pane_id: `p${split}`, tab_id: 'test', agent: 'opencode', agent_status: 'idle',
+          cwd: f.root, foreground_cwd: f.root };
+        return { agent };
+      }
+      if (args[1] === 'prompt') { prompts++; return {}; }
+      return f.transport(...args);
+    };
+    const decision = () => recoveryDecision(f.registered.run, { worker_stopped: true,
+      worker_stop_evidence: 'Fixture command stopped; no background writers or session creation.',
+      partial_work: 'Preserve all prior continuation context, commits, dirty files and report-correction limits.' });
+    await expect(replaceWorker(f.registered.run, 'a', decision(), call)).rejects.toThrow('pre-launch');
+    const failed = JSON.parse(cli('status', f.registered.run).out);
+    await expect(resolveNoLaunch(f.registered.run, 'a', recoveryDecision(f.registered.run, noLaunchEvidence), absentLaunch))
+      .rejects.toThrow('Replacement continuation');
+    const rejected = JSON.parse(cli('status', f.registered.run).out);
+    expect(rejected.run).toEqual(failed.run);
+    expect(rejected.attempts).toEqual(failed.attempts);
+    // Operator confirms the unused failed-start split is closed before retrying replacement.
+    await call('pane', 'close', failed.attempts.at(-1).pane_id);
+    const result = await replaceWorker(f.registered.run, 'a', decision(), call);
+    const after = JSON.parse(cli('status', f.registered.run).out);
+    expect(after.run.stage).toBe('implementing');
+    expect(after.run.repair_count).toBe(before.run.repair_count);
+    expect(after.run.tier).toBe(before.run.tier);
+    expect(after.observed_head).toBe(before.observed_head);
+    expect(after.worktree_fingerprint).toBe(before.worktree_fingerprint);
+    expect(after.attempts.at(-1).correction_count).toBe(before.attempts.at(-1).correction_count);
+    expect(after.attempts.map((a: any) => a.status)).toEqual(['replaced', 'replaced', 'submitted']);
+    expect(readFileSync(after.attempts.at(-1).dispatch_path, 'utf8')).toContain('Preserve all prior continuation context');
+    expect(result.pane).toBe('p4');
+    expect(starts).toBe(2);
+    expect(prompts).toBe(1);
+  }
+});
+
+test('no-launch recovery accepts only the assigned reusable shell and rechecks saved evidence', async () => {
+  const f = dispatchFixture('opencode');
+  await expect(dispatchImplementation(f.registered.run, 'a', 'root', 'test', async (...args) => {
+    if (args[1] === 'start') throw startupError(new Error('probe'), 'prelaunch');
+    return f.transport(...args);
+  })).rejects.toThrow();
+  const db = new Database(join(f.root, '.shawshank/runs/workflow.sqlite'));
+  const row = db.query('SELECT config_json FROM runs').get() as any;
+  db.query('UPDATE runs SET config_json=?').run(JSON.stringify({ ...JSON.parse(row.config_json),
+    reusePane: true, parentPane: 'p2', controllerPane: 'controller' }));
+  db.close();
+  const decision = recoveryDecision(f.registered.run, noLaunchEvidence);
+  let changed = false;
+  const call = async (...args: string[]) => {
+    if (args[0] === 'agent') return absentLaunch(...args);
+    if (args[1] === 'get') return { pane: { pane_id: 'p2', tab_id: changed ? 'other' : 'test' } };
+    return { process_info: { pane_id: 'p2', shell_pid: 42, foreground_process_group_id: 42,
+      foreground_processes: [{ pid: 42, argv0: 'zsh', cwd: f.root }] } };
+  };
+  changed = true;
+  await expect(resolveNoLaunch(f.registered.run, 'a', decision, call)).rejects.toThrow('Pane identity');
+  changed = false;
+  await expect(resolveNoLaunch(f.registered.run, 'a', decision, async (...args) => {
+    const result = await call(...args);
+    if (args[1] === 'process-info') writeFileSync(decision, JSON.stringify({ ...JSON.parse(readFileSync(decision, 'utf8')), evidence: 'changed' }));
+    return result;
+  })).rejects.toThrow('evidence changed');
+  expect((await resolveNoLaunch(f.registered.run, 'a', decision, call)).stage).toBe('registered');
+  expect((await takeOver(f.registered.run, 'b', recoveryDecision(f.registered.run), call)).controller).toBe('b');
+});
+
+test('known unused sessions require OpenCode identity; other workers need no-session evidence', async () => {
+  for (const kind of ['opencode', 'claude', 'codex']) {
+    const f = await finalDispatchFixture();
+    await expect(dispatchFinalReview(f.run, 'final-controller', 'parent', 'test-tab', async (...args) => {
+      if (args[1] === 'start') throw startupError(new Error('prelaunch'), 'prelaunch');
+      return f.call(...args);
+    })).rejects.toThrow();
+    const db = new Database(join(f.root, '.shawshank/runs/workflow.sqlite'));
+    db.query('UPDATE attempts SET worker_kind=?').run(kind);
+    db.close();
+    for (const id of ['ses', 'ses bad', 'other']) {
+      const invalid = recoveryDecision(f.run, { ...noLaunchEvidence, no_session_created: false,
+        session_id: id, session_unused: true });
+      await expect(resolveNoLaunch(f.run, 'final-controller', invalid, absentLaunch)).rejects.toThrow('Establish no session');
+    }
+    const known = recoveryDecision(f.run, { ...noLaunchEvidence, no_session_created: false,
+      session_id: 'ses_unused', session_unused: true });
+    if (kind === 'opencode') {
+      expect((await resolveNoLaunch(f.run, 'final-controller', known, absentLaunch)).stage).toBe('final_ready');
+    } else {
+      await expect(resolveNoLaunch(f.run, 'final-controller', known, absentLaunch)).rejects.toThrow('Establish no session');
+      const absent = recoveryDecision(f.run, noLaunchEvidence);
+      expect((await resolveNoLaunch(f.run, 'final-controller', absent, absentLaunch)).stage).toBe('final_ready');
+    }
+  }
+});
+
+test('same no-launch resolution covers all task and final dispatch stages with bounded repair reservations', async () => {
+  const cases = [
+    ['review_dispatching', 'implementation_accepted', 'review'], ['repair_dispatching', 'repair_required', 'repair'],
+    ['final_dispatching', 'final_ready', 'final_review'], ['final_repair_dispatching', 'final_repair_ready', 'repair'],
+    ['final_verification_dispatching', 'final_verification_ready', 'verification'],
+  ];
+  for (const [stage, next, action] of cases) {
+    const f = await finalDispatchFixture();
+    await expect(dispatchFinalReview(f.run, 'final-controller', 'parent', 'test-tab', async (...args) => {
+      if (args[1] === 'start') throw startupError(new Error('prelaunch'), 'prelaunch');
+      return f.call(...args);
+    })).rejects.toThrow();
+    const db = new Database(join(f.root, '.shawshank/runs/workflow.sqlite'));
+    // Declare a ledger fixture at each dispatch boundary; no live worker is used.
+    const repair = action === 'repair';
+    db.query('UPDATE runs SET stage=?,repair_count=?,tier=?').run(stage, repair ? 4 : 0, repair ? 'capable' : 'standard');
+    db.query('UPDATE attempts SET action=?').run(action);
+    db.close();
+    const decision = recoveryDecision(f.run, noLaunchEvidence);
+    expect((await resolveNoLaunch(f.run, 'final-controller', decision, absentLaunch)).stage).toBe(next);
+    const state = JSON.parse(cli('status', f.run).out);
+    expect(state.run.repair_count).toBe(repair ? 3 : 0);
+    expect(state.run.tier).toBe(stage === 'repair_dispatching' ? 'standard' : repair ? 'capable' : 'standard');
+    expect(state.attempts[0].status).toBe('no_launch');
+    if (stage === 'final_dispatching') {
+      await f.dispatch();
+      expect(JSON.parse(cli('status', f.run).out).run.stage).toBe('final_reviewing');
+    }
+    expect(f.calls.filter(a => a[1] === 'prompt')).toHaveLength(stage === 'final_dispatching' ? 1 : 0);
+  }
+});
+
 test('feature pane survives two complete task loops and final review without a spare shell split', async () => {
   const f = dispatchFixture();
   const previousPane = process.env.HERDR_PANE_ID;
@@ -1505,6 +1773,20 @@ for (const override of [{ agent: 'opencode' }, { tab_id: 'wrong' }, { agent_stat
     expect(f.prompts()).toBe(0);
   });
 }
+
+test('V2 startup errors retain prepared state and cannot enter legacy automatic continuation', async () => {
+  const f = dispatchFixture('opencode');
+  const cause = new HerdrError('approval', 'agent_not_ready');
+  await expect(dispatchImplementation(f.registered.run, 'a', 'p1', 'test', async (...args) => {
+    const result = await f.transport(...args);
+    if (args[1] === 'start') throw startupError(cause, 'session-start', 'ses_fixture');
+    return result;
+  })).rejects.toThrow('session-start unresolved');
+  expect(JSON.parse(cli('status', f.registered.run).out).attempts.at(-1).status).toBe('prepared');
+  await expect(dispatchImplementation(f.registered.run, 'a', 'p1', 'test', f.transport))
+    .rejects.toThrow('explicit startup decision');
+  expect(f.prompts()).toBe(0);
+});
 
 test('concurrent startup continuations claim the prompt exactly once', async () => {
   const f = dispatchFixture();

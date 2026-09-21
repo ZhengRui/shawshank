@@ -12,9 +12,12 @@ Use `bun <absolute-skill>/scripts/workflow.ts` for the verbs below. Registration
 requires a clean Git root at reviewedHEAD, ancestor base, ignored `.shawshank/runs/`
 in the common checkout, and its `.shawshank/config.json` (optional local overlay).
 Use explicit absolute paths for scope/plan references so workers in a different
-repository can read them. Configuration snapshots roles.reviewer, roles.verifier
+repository can read them. See [external-reference permissions](task-contract.md#external-reference-permissions)
+for approval prompts from those paths and shared reviewer instructions.
+Configuration snapshots roles.reviewer, roles.verifier
 (default/hard), roles.implementer tiers and project.commitTrailer. Entries use
-kind (codex/claude/opencode), model and explicit native CLI args. No silent fallback.
+kind (codex/claude/opencode), model and explicit launch args under the
+[worker contract](task-contract.md#worker-configuration). No silent fallback.
 Controller model is chosen at its launch, not by worker configuration.
 Dedicated feature tabs follow [feature-tab.md](feature-tab.md): the assigned
 shell survives reviewer exit and can host final repair, without an empty split.

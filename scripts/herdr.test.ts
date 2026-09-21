@@ -8,7 +8,8 @@ function fixture(kind = 'opencode', failUI = false, changed = false) {
     calls.push(args);
     if (args[1] === 'wait-output' && failUI) throw new HerdrError('UI absent', 'timeout');
     return { agent: { ...agent, ...(changed && args[1] === 'get' ? { terminal_id: 'replacement' } : {}) } };
-  }, async ms => { calls.push(ms); });
+  }, async ms => { calls.push(ms); }, async () => '1.0.0',
+  async (_raw, _args, cli) => ({ version: await cli(['--version']), cli }));
   return { calls, transport, start: ['agent', 'start', 'worker', '--kind', kind, '--pane', 'pane', '--'] };
 }
 

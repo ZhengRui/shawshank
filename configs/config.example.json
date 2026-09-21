@@ -5,7 +5,7 @@
     "commitTrailer": "Co-Authored-By: <agent display name> <noreply@<provider domain>>"
   },
   "roles": {
-    "$comment": "All workers use external Herdr panes. Every role needs kind, model and args. Args are passed verbatim to the worker CLI; metadata does not inject flags. Adapt model and permission flags to the installed CLI and existing authorization. Provider identifies the configured endpoint; do not infer it solely from the harness.",
+    "$comment": "All workers use external Herdr panes. Every role needs kind, model and args. Metadata does not inject flags. Args are native CLI arguments except OpenCode V2 session-selection flags; see references/task-contract.md. Adapt selections and permissions to the installed CLI and existing authorization. Provider identifies the configured endpoint; do not infer it solely from the harness.",
     "taskReviewer": {
       "$comment": "Independent external single-task reviewer for shawshank. Auto evaluates permissions; it does not bypass them.",
       "kind": "claude",
