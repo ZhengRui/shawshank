@@ -1826,8 +1826,6 @@ export async function dispatchReview(runPath: string, controller: string, call: 
       required(worker.model, 'reviewer.model');
       // Snapshot only the selected executable configuration, never project credentials.
       config.reviewer = roleSnapshot(worker);
-      const parent = (await call('pane', 'get', config.parentPane)).pane;
-      if (parent?.pane_id !== config.parentPane || parent.tab_id !== config.tab) throw new Error('Review parent identity mismatch');
       const id = randomUUID();
       attempt = { id, worker_name: `aw-${id.slice(0, 20)}`, worker_kind: worker.kind,
         dispatch_path: join(path, `${id}-dispatch.md`), report_path: join(path, `${id}-report.json`) };
@@ -1845,8 +1843,13 @@ export async function dispatchReview(runPath: string, controller: string, call: 
       if (retained) {
         attempt.worker_name = priorReview.worker_name;
         attempt.pane_id = priorReview.pane_id;
-      // A retained reviewer is prompted, not launched; its saved args are unused.
-      } else requireAuto(worker, 'reviewer.args');
+      } else {
+        // A retained reviewer is prompted in its own pane, never launched, so its
+        // saved args and the parent pane a new split would need are both unused.
+        requireAuto(worker, 'reviewer.args');
+        const parent = (await call('pane', 'get', config.parentPane)).pane;
+        if (parent?.pane_id !== config.parentPane || parent.tab_id !== config.tab) throw new Error('Review parent identity mismatch');
+      }
       db.transaction(() => {
         owned(db, run.id, controller, 'implementation_accepted');
         cleanHead(run);

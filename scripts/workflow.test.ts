@@ -2061,6 +2061,47 @@ test('OpenCode roles without --auto are rejected before any attempt is recorded'
   db.close();
 });
 
+test('a retained reviewer dispatches after the parent pane is gone; a new reviewer still needs it', async () => {
+  const f = await reviewFixture();
+  const seen: string[][] = [];
+  const deadParent = async (...args: string[]) => {
+    seen.push(args);
+    if (args[0] === 'pane' && ['get', 'split'].includes(args[1]) && args.includes('p1'))
+      throw new HerdrError('pane p1 not found', 'pane_not_found');
+    return f.reviewTransport(...args);
+  };
+  // A fresh reviewer is launched by splitting the authorized parent pane, so it still needs one.
+  await expect(dispatchReview(f.registered.run, 'a', deadParent)).rejects.toThrow('pane p1 not found');
+  expect(JSON.parse(cli('status', f.registered.run).out).attempts
+    .some((a: any) => a.action === 'review')).toBe(false);
+
+  const review = await dispatchReview(f.registered.run, 'a', f.reviewTransport);
+  writeFileSync(review.report, JSON.stringify({ attempt_id: review.attempt_id,
+    base_sha: f.registered.base_sha, head_sha: f.head, evidence: 'Synthetic repair fixture.',
+    findings: [{ id: 'F1', severity: 'major', category: 'in_scope', status: 'open', title: 'Fixture', evidence: 'Fixture-only finding.' }] }));
+  await acceptReview(f.registered.run, 'a', f.reviewTransport);
+  const decision = join(f.registered.run, 'role-triage.json');
+  writeFileSync(decision, JSON.stringify({ attempt_id: review.attempt_id, head_sha: f.head,
+    decisions: [{ id: 'F1', action: 'fix', evidence: 'Synthetic repair scenario.' }] }));
+  await recordTriage(f.registered.run, 'a', decision, f.reviewTransport);
+  const repair = await dispatchRepair(f.registered.run, 'a', f.reviewTransport);
+  writeFileSync(join(f.root, 'sample.ts'), 'export const answer = 43;\n');
+  f.commit();
+  const head = JSON.parse(cli('status', f.registered.run).out).observed_head;
+  writeFileSync(repair.report, JSON.stringify({ attempt_id: repair.attempt_id,
+    base_sha: f.registered.base_sha, head_sha: head, status: 'DONE', concerns: [],
+    checks: [{ requirement: f.task.acceptance[0], status: 'PASS', evidence: { command: 'fixture assertion', result: 'passed' } }] }));
+  await acceptImplementation(f.registered.run, 'a', f.reviewTransport);
+
+  // The retained reviewer keeps its own pane, so a since-closed parent must not block it.
+  seen.length = 0;
+  const rereview = await dispatchReview(f.registered.run, 'a', deadParent);
+  expect(rereview.worker).toBe(review.worker);
+  expect(rereview.pane).toBe(review.pane);
+  expect(seen.some(a => a.includes('p1'))).toBe(false);
+  expect(seen.some(a => a[0] === 'pane' && a[1] === 'split')).toBe(false);
+});
+
 test('OpenCode roles snapshotted for later stages also require --auto', async () => {
   const f = dispatchFixture('codex');
   writeFileSync(join(f.root, '.shawshank/config.local.json'), JSON.stringify({ roles: {
