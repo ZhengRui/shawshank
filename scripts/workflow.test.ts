@@ -602,6 +602,35 @@ test('final repair commit correction preserves evidence and repair budget before
   expect(f.observe().attempts.at(-1).correction_count).toBe(1);
 });
 
+test('a retained final implementer dispatches after the parent pane is gone', async () => {
+  const f = await finalLoopFixture();
+  f.triage([{ id: 'F1', action: 'fix', evidence: 'Synthetic valid finding' }]);
+  const first = await f.repair(1);
+  await acceptFinalWork(f.run, 'final-controller', 'repair', f.call);
+  const v = await f.verify(first, 'FAIL');
+  writeFileSync(v.attempt.report, JSON.stringify(v.report));
+  await acceptFinalWork(f.run, 'final-controller', 'verification', f.call);
+  f.triage([{ id: 'F1', action: 'fix', evidence: 'Synthetic valid finding' }]);
+
+  const seen: string[][] = [];
+  const deadParent = async (...args: string[]) => {
+    seen.push(args);
+    if (args[0] === 'pane' && ['get', 'split'].includes(args[1]) && args.includes('parent'))
+      throw new HerdrError('pane parent not found', 'pane_not_found');
+    return f.call(...args);
+  };
+  // Round 2 re-prompts the retained implementer in its own pane, so a parent
+  // closed since the final review must not strand the run at final_repair_ready.
+  await dispatchFinalWork(f.run, 'final-controller', 'repair', deadParent);
+  const repairs = f.observe().attempts.filter((a: any) => a.action === 'repair');
+  expect(repairs).toHaveLength(2);
+  expect(repairs[1].worker_name).toBe(repairs[0].worker_name);
+  expect(repairs[1].pane_id).toBe(repairs[0].pane_id);
+  expect(seen.some(a => a.includes('parent'))).toBe(false);
+  expect(seen.some(a => a[0] === 'pane' && a[1] === 'split')).toBe(false);
+  expect(f.observe().run.repair_count).toBe(2);
+});
+
 test('final loop reuses implementer, uses fresh verifiers and gates exact completion evidence', async () => {
   const f = await finalLoopFixture();
   for (const [index, result] of ['FAIL', 'PARTIAL', 'PASS'].entries()) {

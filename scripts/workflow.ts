@@ -1634,13 +1634,17 @@ async function dispatchFinalAttempt(runPath: string, controller: string,
       const worker = initial ? config.reviewer : repair ? config.implementerTiers?.[decision.implementer_tier]?.[0] : config.verifier?.[decision.verifier_tier];
       if (!['codex', 'claude', 'opencode'].includes(worker?.kind)) throw new Error('Unsupported final reviewer');
       required(worker.model, 'reviewer.model'); strings(worker.args, 'reviewer.args');
-      // A retained implementer is prompted, not launched; its saved args are unused.
+      // A retained implementer is prompted in its own pane, never launched, so its
+      // saved args and the parent pane a new split would need are both unused.
       if (!retained) requireAuto(worker, 'reviewer.args');
       if (!initial && (await cleanupWorkers(path, controller, call)).pending.length) throw new Error('Pending worker cleanup');
       if (retained && (prior.worker_kind !== worker.kind || prior.model !== worker.model)) throw new Error('Retained implementer configuration changed');
+      required(tab, 'tab');
       if (retained) ready((await call('agent', 'get', prior.worker_name)).agent, prior, tab);
-      const parent = (await call('pane', 'get', required(parentPane, 'parent pane'))).pane;
-      if (parent?.pane_id !== parentPane || parent.tab_id !== required(tab, 'tab')) throw new Error('Parent identity mismatch');
+      else {
+        const parent = (await call('pane', 'get', required(parentPane, 'parent pane'))).pane;
+        if (parent?.pane_id !== parentPane || parent.tab_id !== tab) throw new Error('Parent identity mismatch');
+      }
       const input = JSON.parse(readFileSync(run.task_path, 'utf8'));
       const instructions = finalInstructions(run, initial ? 'final-reviewer.md' : repair ? 'implementer.md' : 'final-verifier.md');
       const id = randomUUID();
