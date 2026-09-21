@@ -63,14 +63,55 @@ automatic availability fallback is not implemented.
 
 ### External-reference permissions
 
-Standalone briefs remain at their caller-owned paths. When outside the worker's
-repository, they can trigger an OpenCode external-directory approval prompt in
-each fresh session, depending on its permission configuration. Final-stage workers
-also read shared instructions such as `references/final-reviewer.md`, which can
-trigger the same prompt when the skill is outside the repository.
+New dispatches read verified input copies under the actual worker worktree's
+`.shawshank/inputs/<run-id>/<snapshot-id>/`, including linked worktrees. The
+canonical bytes and SHA-256 manifest remain in the run's `worker-inputs/` storage.
+At first use, standalone briefs are pinned; plan-linked briefs use their existing
+retained revision. Later edits to the source do not change the dispatched brief.
+Authorized scope amendments create a new snapshot, never overwrite an old one.
+Copies are write-once, read-only files. Snapshot creation and verification happen
+before claiming dispatch or continuation, so a local input error does not reserve
+an attempt/repair round or consume a resumable startup. While still registered,
+the source brief must match its retained copy; a changed source is rejected, not
+silently replaced or ignored. Restore the retained approved bytes or use an
+explicitly approved revised input rather than overwriting snapshots.
+Acceptance verifies existing snapshots but never creates them or rereads a legacy
+caller's brief. These checks detect changes, not a security boundary against the
+worker's OS account.
+Missing or changed snapshots stop the operation instead of silently refreshing.
+Publication builds complete sibling staging directories and renames them into
+place. If interrupted between retained and worktree publication, a pending marker
+allows preflight to finish from verified retained bytes, never rereading changed
+sources. Completed snapshots are not regenerated. Preflight removes only staging
+directories whose creating process is confirmed absent; validation ignores staging
+and unrelated metadata such as Finder's `.DS_Store`.
+
+The explicit dependency list follows current dispatch instructions:
+
+- Task implementation, review/re-review and repair: the approved brief only;
+  these dispatches inline their role contract, so no extra role files are copied.
+- Final review: `references/final-reviewer.md`, `interaction-checklist.md`,
+  `browser-devtools.md`, and `SKILL.md` for the role's required artifact-storage link.
+- Final repair: `references/implementer.md`, `interaction-checklist.md` (explicitly
+  named by the dispatch), and `SKILL.md` for the artifact-storage link.
+- Final verification: `references/final-verifier.md` plus the final-review bundle,
+  because the verifier explicitly links the reviewer's runtime/browser sections.
+
+Relative bundled links retain their layout. Only the named sections apply;
+controller links elsewhere in `SKILL.md` are not additional worker inputs.
+There is no recursive copying of arbitrary linked resources. Replacements and
+corrections retain their original inputs. Ignore setup is described in `SETUP.md`.
+Acceptance rejects tracked snapshots; implementation and final-repair acceptance
+also reuse their existing per-commit scope walk to reject add-then-delete commits.
+Final review checks the accepted diff, without adding a separate history scanner.
+
+Dispatch files, reports, evidence and other scope/plan references remain at their
+existing paths. These can still trigger OpenCode external-directory approval
+prompts in each fresh session, depending on permission configuration; local input
+copies do not promise unattended operation.
 Inspect the actual requested resource and follow the user's permission boundaries;
 a dispatch reference is not permission to approve broader access. Do not silently
-add persistent permissions. Plan-linked briefs use run-local snapshots instead.
+add persistent permissions.
 
 ## Worker configuration
 
