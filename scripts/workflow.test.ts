@@ -2089,6 +2089,48 @@ test('task reviewer snapshot survives later role overrides', async () => {
   expect(starts[0]?.slice(starts[0].indexOf('--'))).toEqual(['--','--model','review-fixture']);
 });
 
+test('a retained legacy OpenCode reviewer is reused without --auto; a fresh launch still requires it', async () => {
+  const f = await reviewFixture(true, 'codex', 'opencode');
+  const starts: string[][] = [];
+  const transport = async (...args: string[]) => {
+    if (args[1] === 'start') starts.push(args);
+    return f.reviewTransport(...args);
+  };
+  const review = await dispatchReview(f.registered.run, 'a', transport);
+  writeFileSync(review.report, JSON.stringify({ attempt_id: review.attempt_id,
+    base_sha: f.registered.base_sha, head_sha: f.head, evidence: 'Synthetic repair fixture.',
+    findings: [{ id: 'F1', severity: 'major', category: 'in_scope', status: 'open', title: 'Fixture', evidence: 'Fixture-only finding.' }] }));
+  await acceptReview(f.registered.run, 'a', transport);
+  const decision = join(f.registered.run, 'role-triage.json');
+  writeFileSync(decision, JSON.stringify({ attempt_id: review.attempt_id, head_sha: f.head,
+    decisions: [{ id: 'F1', action: 'fix', evidence: 'Synthetic repair scenario.' }] }));
+  await recordTriage(f.registered.run, 'a', decision, transport);
+  const repair = await dispatchRepair(f.registered.run, 'a', transport);
+  writeFileSync(join(f.root, 'sample.ts'), 'export const answer = 43;\n');
+  f.commit();
+  const head = JSON.parse(cli('status', f.registered.run).out).observed_head;
+  writeFileSync(repair.report, JSON.stringify({ attempt_id: repair.attempt_id,
+    base_sha: f.registered.base_sha, head_sha: head, status: 'DONE', concerns: [],
+    checks: [{ requirement: f.task.acceptance[0], status: 'PASS', evidence: { command: 'fixture assertion', result: 'passed' } }] }));
+  await acceptImplementation(f.registered.run, 'a', transport);
+  // Older runs saved OpenCode reviewers before --auto became mandatory.
+  const db = new Database(join(f.root, '.shawshank/runs/workflow.sqlite'));
+  const saved = JSON.parse((db.query('SELECT config_json FROM runs').get() as any).config_json);
+  saved.reviewer.args = saved.reviewer.args.filter((arg: string) => arg !== '--auto');
+  db.query('UPDATE runs SET config_json=?').run(JSON.stringify(saved));
+  const state = (db.query('SELECT cleanup_state FROM attempts WHERE id=?').get(review.attempt_id) as any).cleanup_state;
+  const attempts = () => (db.query('SELECT count(*) AS n FROM attempts').get() as any).n;
+  const before = attempts();
+  db.query("UPDATE attempts SET cleanup_state='closed' WHERE id=?").run(review.attempt_id);
+  await expect(dispatchReview(f.registered.run, 'a', transport)).rejects.toThrow('reviewer.args must include --auto for OpenCode workers');
+  expect(attempts()).toBe(before);
+  db.query('UPDATE attempts SET cleanup_state=? WHERE id=?').run(state, review.attempt_id);
+  db.close();
+  const rereview = await dispatchReview(f.registered.run, 'a', transport);
+  expect(rereview.worker).toBe(review.worker);
+  expect(starts).toHaveLength(1);
+});
+
 for (const kind of ['claude', 'opencode']) {
   for (const reviewerKind of ['codex', 'claude', 'opencode']) {
     test(`configurable roles complete and repair: ${kind}/${reviewerKind}`, async () => {

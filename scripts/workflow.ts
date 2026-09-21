@@ -1822,7 +1822,7 @@ export async function dispatchReview(runPath: string, controller: string, call: 
       cleanHead(run);
       const worker = config.reviewer ?? projectConfig(run.worktree_path).roles?.taskReviewer;
       if (!worker || !['codex', 'opencode', 'claude'].includes(worker.kind)) throw new Error('Supported reviewer configuration is required');
-      launchArgs(worker, 'reviewer.args');
+      strings(worker.args, 'reviewer.args');
       required(worker.model, 'reviewer.model');
       // Snapshot only the selected executable configuration, never project credentials.
       config.reviewer = roleSnapshot(worker);
@@ -1845,7 +1845,8 @@ export async function dispatchReview(runPath: string, controller: string, call: 
       if (retained) {
         attempt.worker_name = priorReview.worker_name;
         attempt.pane_id = priorReview.pane_id;
-      }
+      // A retained reviewer is prompted, not launched; its saved args are unused.
+      } else requireAuto(worker, 'reviewer.args');
       db.transaction(() => {
         owned(db, run.id, controller, 'implementation_accepted');
         cleanHead(run);
