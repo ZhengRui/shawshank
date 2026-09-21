@@ -92,10 +92,6 @@ Worker duties are in [implementer.md](references/implementer.md),
 Read the implementer handoff before final repair and
 [final-verifier.md](references/final-verifier.md) before verification.
 Generated dispatches provide exact inputs, output paths and schemas.
-New dispatches pin brief and required bundled instruction copies inside the
-worker's ignored `.shawshank/inputs/`; prompts and acceptance verify their hashes.
-See task-contract's external-reference permissions for the exact dependency list
-and remaining approval prompts. Dispatches, reports and evidence are not moved.
 For interaction-heavy scope, read
 [interaction-checklist.md](references/interaction-checklist.md).
 

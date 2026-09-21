@@ -91,10 +91,6 @@ machine/account overrides in `.shawshank/config.local.json`. Prefer account-acce
 references in briefs; never copy credentials into tracked settings or reports.
 Ensure the common checkout ignores `.shawshank/config.local.json` and `.shawshank/runs/`.
 Keep `.shawshank/config.json` trackable; do not ignore the entire directory.
-Worker input copies live in `.shawshank/inputs/` inside each actual worktree.
-Shawshank reuses effective ignore rules; otherwise it appends
-`/.shawshank/inputs/` to Git's resolved `info/exclude` (shared by linked worktrees).
-It never edits tracked `.gitignore` files and rejects tracked input copies.
 Check whether either is already tracked: ignore rules do not untrack files. Report
 that condition and agree on handling it rather than silently deleting their data.
 
