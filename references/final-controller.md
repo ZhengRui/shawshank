@@ -13,7 +13,7 @@ requires a clean Git root at reviewedHEAD, ancestor base, ignored `.shawshank/ru
 in the common checkout, and its `.shawshank/config.json` (optional local overlay).
 Use explicit absolute paths for scope/plan references so workers in a different
 repository can read them. See [external-reference permissions](task-contract.md#external-reference-permissions)
-for remaining approval prompts and verified worktree-local instruction copies.
+for approval prompts from those paths and shared reviewer instructions.
 Configuration snapshots roles.reviewer, roles.verifier
 (default/hard), roles.implementer tiers and project.commitTrailer. Entries use
 kind (codex/claude/opencode), model and explicit launch args under the

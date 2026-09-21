@@ -208,9 +208,7 @@ for (const mode of ['normal', 'paused', 'no-launch']) test(`amended scope flows 
   const repairState = state(), prompt = readFileSync(repairState.attempts.at(-1).dispatch_path, 'utf8');
   expect(prompt).toContain('existing.test.ts');
   const current = JSON.parse(readFileSync(repairState.run.task_path, 'utf8'));
-  const localBrief = prompt.match(/^Approved brief: (.+)$/m)![1];
-  expect(localBrief.startsWith(join(f.root, '.shawshank/inputs/'))).toBe(true);
-  expect(readFileSync(localBrief, 'utf8')).toBe(readFileSync(current.brief, 'utf8'));
+  expect(prompt).toContain(current.brief);
   expect(readFileSync(current.brief, 'utf8')).toContain('Authorized scope correction');
   expect(repair.worker).toBe(first.worker);
   if (mode === 'paused') {

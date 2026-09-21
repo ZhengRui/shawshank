@@ -7,7 +7,6 @@ import { herdr, HerdrError, startupBlocked, type HerdrCall } from './herdr';
 import { isOpenCodeSessionID } from './opencode';
 import { provenanceInstructions, validateProvenance, retainedRole } from './commit-provenance';
 import { allocatePane, prepareShell, returnToShell, shellPane } from './feature-pane';
-import { snapshotWorkerInputs, verifyWorkerInputs, rejectWorkerInputPaths } from './worker-inputs';
 
 function git(cwd: string, ...args: string[]): string {
   const result = Bun.spawnSync(['git', '-C', cwd, ...args]);
@@ -932,11 +931,6 @@ function currentTaskInput(run: any, path: string) {
   return task;
 }
 
-function workerBrief(run: any, source: string) {
-  return snapshotWorkerInputs(run.worktree_path, join(paths(run.worktree_path).root, run.id),
-    `brief:${source}`, { 'brief.md': source })['brief.md'];
-}
-
 function owned(db: Database, id: string, controller: string, stage: string, recovery = false) {
   const current = db.query('SELECT * FROM runs WHERE id = ?').get(id) as any;
   if (current.controller_id !== controller) throw new Error('Controller does not own this run');
@@ -1007,7 +1001,6 @@ export async function replaceWorker(runPath: string, controller: string, decisio
     if (previous.correction_count) required(readFileSync(correctionContext, 'utf8'), 'correction context');
     if (previous.correction_count && readFileSync(correctionContext, 'utf8').startsWith('# One commit-message correction\n'))
       throw new Error('Interrupted commit-message correction requires user judgment, not worker replacement');
-    verifyWorkerInputs(run.worktree_path, path, previous.dispatch_path);
     const before = recoverySnapshot(db, run);
     if (!previous.pane_id) {
       // Missing launch receipt is ambiguous, not evidence that launch never ran.
@@ -1113,7 +1106,7 @@ export async function replaceWorker(runPath: string, controller: string, decisio
       throw error;
     }
     db.transaction(() => { owned(db,run.id,controller,stage); db.query("UPDATE attempts SET status='prompting' WHERE id=?").run(id); }).immediate();
-    await call('agent', 'prompt', name, `Read ${dispatch} and follow it exactly.`);
+    await call('agent','prompt',name,`Read ${dispatch} and follow it exactly.`);
     db.transaction(() => {
       owned(db,run.id,controller,stage);
       db.query("UPDATE attempts SET status='submitted' WHERE id=?").run(id);
@@ -1338,7 +1331,7 @@ function finalFindings(db: Database, run: any): any[] {
   return findings;
 }
 
-function finalWorkPrompt(db: Database, run: any, attempt: any, action: string, input: any, decision: any, instructions: string) {
+function finalWorkPrompt(db: Database, run: any, attempt: any, action: string, input: any, decision: any) {
   const review = finalAttempt(db, run, 'final_review');
   const repair = action === 'verification' ? finalAttempt(db, run, 'repair') : null;
   const common = { attempt_id: attempt.id, review_id: review.attempt.id, round: run.repair_count + (repair ? 0 : 1),
@@ -1349,7 +1342,7 @@ function finalWorkPrompt(db: Database, run: any, attempt: any, action: string, i
       checks: input.requiredChecks.map((requirement: string) => ({ requirement, status: 'PASS', evidence: '<command and result>' })) };
   if (repair && modernFinal(run)) Object.assign(schema, { coverage: coverageExample(input) });
   return `# ${repair ? 'Independent scoped finding verification' : 'Authorized final-review repair'}\n\n` +
-    instructions +
+    finalInstructions(run, repair ? 'final-verifier.md' : 'implementer.md') +
     `Repository: ${run.worktree_path}\nApproved input: ${run.task_path}\n${JSON.stringify(input, null, 2)}\n` +
     `Original review: ${review.attempt.report_path}\nDecision: ${run.decision_path}\n${JSON.stringify(decision, null, 2)}\n` +
     `Current findings: ${JSON.stringify(finalFindings(db, run), null, 2)}\n` +
@@ -1368,14 +1361,10 @@ function modernFinal(run: any) { return JSON.parse(run.config_json).finalReviewS
 
 function finalInstructions(run: any, role: string) {
   if (!modernFinal(run)) return '';
-  // The dispatch explicitly requires the role and conditional checklist. Role
-  // links require artifact storage, and reviewer/verifier browser guidance.
-  const names = ['SKILL.md', `references/${role}`, 'references/interaction-checklist.md'];
-  if (role !== 'implementer.md') names.push('references/final-reviewer.md', 'references/browser-devtools.md');
-  const sources = Object.fromEntries([...new Set(names)].map(name => [name, resolve(import.meta.dir, '..', name)]));
-  const files = snapshotWorkerInputs(run.worktree_path, join(paths(run.worktree_path).root, run.id), `instructions:${role}`, sources);
-  const path = files[`references/${role}`];
-  const checklist = files['references/interaction-checklist.md'];
+  const path = resolve(import.meta.dir, '../references', role);
+  required(readFileSync(path, 'utf8'), 'internal role instructions');
+  const checklist = resolve(import.meta.dir, '../references/interaction-checklist.md');
+  required(readFileSync(checklist, 'utf8'), 'interaction checklist');
   return `Read and follow ${path} before work. For interaction-heavy changes, also read ${checklist}. These are internal instructions; do not invoke another review skill.\n`;
 }
 
@@ -1467,7 +1456,6 @@ export async function acceptFinalWork(runPath: string, controller: string, actio
     owned(db, run.id, controller, stage);
     const attempt = db.query("SELECT * FROM attempts WHERE run_id=? AND action=? AND status='submitted'").get(run.id, action) as any;
     if (!attempt) throw new Error('No submitted final delivery');
-    verifyWorkerInputs(run.worktree_path, path, attempt.dispatch_path);
     const agent = (await call('agent', 'get', attempt.worker_name)).agent;
     ready(agent, attempt, JSON.parse(run.config_json).tab);
     if (realpathSync(required(agent.cwd, 'worker cwd')) !== run.worktree_path || realpathSync(required(agent.foreground_cwd, 'worker foreground cwd')) !== run.worktree_path) throw new Error('Worker directory differs');
@@ -1491,7 +1479,6 @@ export async function acceptFinalWork(runPath: string, controller: string, actio
       const trailer = required(JSON.parse(run.config_json).trailer, 'commit trailer');
       for (const commit of commits) {
         const files = git(run.worktree_path, 'diff-tree', '--root', '-m', '--no-commit-id', '--name-only', '--no-renames', '-r', '-z', commit).split('\0').filter(Boolean);
-        rejectWorkerInputPaths(files);
         if (files.some(file => !input.scope.allowedPaths.some((p: string) => file === p.replace(/\/$/, '') || file.startsWith(p.replace(/\/$/, '') + '/')))) throw new Error('Repair changed files outside allowed scope');
         const message = git(run.worktree_path, 'show', '-s', '--format=%B', commit);
         validateDispatchedProvenance(message, commit, run, attempt);
@@ -1610,7 +1597,6 @@ async function dispatchFinalAttempt(runPath: string, controller: string,
       if (!attempt) throw new Error('Final dispatch unresolved; replay is forbidden');
       startupWorktree(run, attempt);
       ready((await call('agent', 'get', attempt.worker_name)).agent, attempt, tab);
-      verifyWorkerInputs(run.worktree_path, path, attempt.dispatch_path);
       db.transaction(() => {
         owned(db, run.id, controller, dispatching);
         if (db.query("UPDATE attempts SET status='prompting' WHERE id=? AND status='startup_blocked'").run(attempt.id).changes !== 1)
@@ -1639,8 +1625,6 @@ async function dispatchFinalAttempt(runPath: string, controller: string,
       attempt = { id, worker_name: `aw-${id.slice(0, 20)}`, worker_kind: worker.kind,
         dispatch_path: join(path, `${id}-dispatch.md`), report_path: join(path, `${id}-report.json`) };
       if (retained) { attempt.worker_name = prior.worker_name; attempt.pane_id = prior.pane_id; }
-      const workPrompt = initial ? '' : finalWorkPrompt(db, run, attempt, action, input, decision, instructions);
-      verifyWorkerInputs(run.worktree_path, path);
       db.transaction(() => {
         owned(db, run.id, controller, from); cleanHead(run);
         const now = new Date().toISOString();
@@ -1670,7 +1654,7 @@ async function dispatchFinalAttempt(runPath: string, controller: string,
             description: '<problem and expected behavior>', evidence: '<file:line and reproduction>',
             ...(modernFinal(run) ? { location: '<file:line or concrete runtime location>', expected: '<required behavior>', actual: '<observed behavior>', reproduction: '<steps or why inapplicable>' } : {}) }] }, null, 2)}\n` +
         `Use findings: [] if no issues exist. This is report-only delivery, not authorization to repair.\n` :
-        workPrompt, { flag: 'wx' });
+        finalWorkPrompt(db, run, attempt, action, input, decision), { flag: 'wx' });
       if (!retained) {
       const pane = await allocatePane(call, { ...config, parentPane, tab }, run.worktree_path, 'down');
       if (!pane?.pane_id || pane.tab_id !== tab || (pane.pane_id === parentPane && !config.reusePane) ||
@@ -1709,8 +1693,6 @@ export async function acceptFinalReview(runPath: string, controller: string, cal
     owned(db, run.id, controller, 'final_reviewing');
     const attempt = db.query("SELECT * FROM attempts WHERE run_id=? AND action='final_review' AND status='submitted'").get(run.id) as any;
     if (!attempt) throw new Error('No submitted final review');
-    verifyWorkerInputs(run.worktree_path, path, attempt.dispatch_path);
-    rejectWorkerInputPaths(git(run.worktree_path, 'diff', '--name-only', '--no-renames', '-z', `${run.base_sha}..${run.accepted_head}`).split('\0').filter(Boolean));
     const before = recoveryDecision ? recoverySnapshot(db, run) : undefined;
     const decisionBytes = recoveryDecision ? readFileSync(recoveryDecision) : undefined;
     const validateRecovery = () => {
@@ -1807,7 +1789,6 @@ export async function dispatchReview(runPath: string, controller: string, call: 
       if (!attempt) throw new Error('Review dispatch unresolved; replay is forbidden');
       startupWorktree(run,attempt);
       ready((await call('agent', 'get', attempt.worker_name)).agent, attempt, config.tab);
-      verifyWorkerInputs(run.worktree_path, path, attempt.dispatch_path);
       db.transaction(() => {
         owned(db, run.id, controller, 'review_dispatching');
         if (db.query("UPDATE attempts SET status='prompting' WHERE id=? AND status='startup_blocked'")
@@ -1829,7 +1810,6 @@ export async function dispatchReview(runPath: string, controller: string, call: 
       attempt = { id, worker_name: `aw-${id.slice(0, 20)}`, worker_kind: worker.kind,
         dispatch_path: join(path, `${id}-dispatch.md`), report_path: join(path, `${id}-report.json`) };
       const input = currentTaskInput(run, path);
-      input.brief = workerBrief(run, input.brief);
       const task = JSON.stringify(input, null, 2);
       const brief = readFileSync(resolve(dirname(run.task_path), input.brief), 'utf8');
       const previous = run.repair_count > 0 && run.decision_path ? readFileSync(run.decision_path, 'utf8') : null;
@@ -1844,7 +1824,6 @@ export async function dispatchReview(runPath: string, controller: string, call: 
         attempt.worker_name = priorReview.worker_name;
         attempt.pane_id = priorReview.pane_id;
       }
-      verifyWorkerInputs(run.worktree_path, path);
       db.transaction(() => {
         owned(db, run.id, controller, 'implementation_accepted');
         cleanHead(run);
@@ -1917,7 +1896,6 @@ export async function acceptReview(runPath: string, controller: string, call: He
     const attempt = db.query("SELECT * FROM attempts WHERE run_id=? AND action='review' AND status='submitted'")
       .get(run.id) as any;
     if (!attempt) throw new Error('No submitted review');
-    verifyWorkerInputs(run.worktree_path, path, attempt.dispatch_path);
     ready((await call('agent', 'get', attempt.worker_name)).agent, attempt, JSON.parse(run.config_json).tab);
     cleanHead(run);
     const report = reviewReport(attempt, run);
@@ -1993,7 +1971,6 @@ export async function dispatchRepair(runPath: string, controller: string, call: 
       if (!pending) throw new Error('Repair dispatch unresolved; replay is forbidden');
       startupWorktree(run,pending);
       ready((await call('agent', 'get', pending.worker_name)).agent, pending, config.tab);
-      verifyWorkerInputs(run.worktree_path, path, pending.dispatch_path);
       db.transaction(() => {
         owned(db, run.id, controller, 'repair_dispatching');
         if (db.query("UPDATE attempts SET status='prompting' WHERE id=? AND status='startup_blocked'").run(pending.id).changes !== 1)
@@ -2039,8 +2016,6 @@ export async function dispatchRepair(runPath: string, controller: string, call: 
     if (decision.attempt_id !== review.id || decision.head_sha !== run.accepted_head ||
       !decision.decisions.some((d: any) => d.action === 'fix')) throw new Error('Repair decision does not match current review');
     const task = currentTaskInput(run, path);
-    task.brief = workerBrief(run, task.brief);
-    verifyWorkerInputs(run.worktree_path, path);
     if (escalate) await closeWorker(db, run, controller, previous, call);
     const id = randomUUID();
     const name = escalate ? `aw-${id.slice(0, 20)}` : previous.worker_name;
@@ -2143,14 +2118,13 @@ export async function correctReport(runPath: string, controller: string, action:
       required(readFileSync(prompt,'utf8'),'retained correction prompt');
       if (readFileSync(prompt, 'utf8').startsWith('# One commit-message correction\n') !== commitMessage)
         throw new Error('Use the original correction mode');
-      verifyWorkerInputs(run.worktree_path, path, pending.dispatch_path);
       db.transaction(() => {
         owned(db,run.id,controller,stage);
         if (db.query("UPDATE attempts SET status='correcting' WHERE id=? AND status='correction_ready'").run(pending.id).changes !== 1)
           throw new Error('Correction continuation already claimed');
       }).immediate();
       claimed = true;
-      await call('agent', 'prompt', pending.worker_name, `Read ${prompt} and follow it exactly.`);
+      await call('agent','prompt',pending.worker_name,`Read ${prompt} and follow it exactly.`);
       saveAttempt(db,run,controller,stage,"UPDATE attempts SET status='submitted' WHERE id=?",pending.id);
       return {run:path,attempt_id:pending.id,report:pending.report_path,correction_count:pending.correction_count};
     }
@@ -2186,7 +2160,6 @@ export async function correctReport(runPath: string, controller: string, action:
     const originalReport = commitMessage ? JSON.parse(readFileSync(attempt.report_path, 'utf8')) : undefined;
     if (commitMessage && (originalReport.attempt_id !== attempt.id || originalReport.head_sha !== head))
       throw new Error('Commit correction requires the original report for current HEAD');
-    verifyWorkerInputs(run.worktree_path, path, attempt.dispatch_path);
     db.transaction(() => {
       owned(db, run.id, controller, stage);
       cleanHead(run, head);
@@ -2248,7 +2221,6 @@ export async function dispatchImplementation(runPath: string, controller: string
       if (agent?.name !== pending.worker_name || agent.pane_id !== pending.pane_id ||
         agent.tab_id !== tab || agent.agent !== pending.worker_kind ||
         !['idle', 'done'].includes(agent.agent_status)) throw new Error('Original worker is not ready');
-      verifyWorkerInputs(run.worktree_path, path, pending.dispatch_path);
       db.transaction(() => {
         owned(db, run.id, controller, 'dispatching');
         const claimed = db.query('UPDATE attempts SET status=? WHERE id=? AND status=?')
@@ -2276,13 +2248,7 @@ export async function dispatchImplementation(runPath: string, controller: string
         throw new Error('Retained task input changed');
     };
     checkTaskSnapshot();
-    const sourceBrief = resolve(dirname(run.task_path), task.brief);
-    const localBrief = workerBrief(run, sourceBrief);
-    const checkBriefSnapshot = () => {
-      if (!readFileSync(sourceBrief).equals(readFileSync(localBrief))) throw new Error('Retained brief input changed');
-    };
-    checkBriefSnapshot();
-    const brief = readFileSync(localBrief, 'utf8');
+    const brief = readFileSync(resolve(dirname(run.task_path), task.brief), 'utf8');
     const config = projectConfig(run.worktree_path);
     const placement = reusePane ? { reusePane: true, controllerPane: required(process.env.HERDR_PANE_ID, 'verified controller pane') } : {};
     if (reusePane) await prepareShell(call, parentPane, tab, run.worktree_path, placement.controllerPane!);
@@ -2299,11 +2265,9 @@ export async function dispatchImplementation(runPath: string, controller: string
     const name = `aw-${id.slice(0, 20)}`;
     const dispatch = join(path, `${id}-dispatch.md`);
     const report = join(path, `${id}-report.json`);
-    verifyWorkerInputs(run.worktree_path, path);
     db.transaction(() => {
       owned(db, run.id, controller, 'registered');
       checkTaskSnapshot();
-      checkBriefSnapshot();
       const now = new Date().toISOString();
       db.query(`INSERT INTO attempts (id,run_id,action,status,worker_kind,model,worker_name,
         dispatch_path,report_path,base_sha,started_at) VALUES (?,?,'implementation','prepared',?,?,?,?,?,?,?)`)
@@ -2319,7 +2283,7 @@ export async function dispatchImplementation(runPath: string, controller: string
     if (!existsSync(taskSnapshot)) writeFileSync(taskSnapshot, JSON.stringify(task, null, 2), { flag: 'wx' });
     writeFileSync(dispatch, `# Implement one approved task\n\nWork only in ${run.worktree_path}.\n` +
       `No subagents, review, push, pane control, or unrelated changes. Implement, test, and commit.\n` +
-      `Commit trailer: ${trailer}\nTask input:\n\n${JSON.stringify({ ...task, brief: localBrief }, null, 2)}\n\nBrief:\n${brief}\n\n` +
+      `Commit trailer: ${trailer}\nTask input:\n\n${JSON.stringify(task, null, 2)}\n\nBrief:\n${brief}\n\n` +
       provenanceInstructions(config.project?.commitProvenance === true, roleSnapshot(worker), run.base_sha) +
       `Write JSON only to ${report}, using this contract:\n` +
       JSON.stringify({ attempt_id: id, base_sha: run.base_sha, head_sha: '<full resulting SHA>',
@@ -2364,7 +2328,6 @@ export async function acceptImplementation(runPath: string, controller: string, 
     owned(db, run.id, controller, 'implementing');
     const attempt = db.query('SELECT * FROM attempts WHERE run_id=? AND status=?').get(run.id, 'submitted') as any;
     if (!attempt) throw new Error('No submitted implementation');
-    verifyWorkerInputs(run.worktree_path, path, attempt.dispatch_path);
     const config = JSON.parse(run.config_json);
     const agent = (await call('agent', 'get', attempt.worker_name)).agent;
     if (agent?.name !== attempt.worker_name || agent.pane_id !== attempt.pane_id ||
@@ -2391,7 +2354,6 @@ export async function acceptImplementation(runPath: string, controller: string, 
     for (const commit of commits) {
       const files = git(run.worktree_path, 'diff-tree', '--root', '-m', '--no-commit-id', '--name-only',
         '--no-renames', '-r', '-z', commit).split('\0').filter(Boolean);
-      rejectWorkerInputPaths(files);
       if (files.some(file => !allowed(file))) throw new Error('Commit changes files outside allowed scope');
       const message = git(run.worktree_path, 'show', '-s', '--format=%B', commit);
       validateDispatchedProvenance(message, commit, run, attempt);
