@@ -53,7 +53,7 @@ test('pre-version attribution preserves hash selectors and prefers explicit vari
 });
 
 test('known launch values cannot be discarded but runtime alias resolution remains allowed', () => {
-  const expected = launchAttribution({ kind: 'opencode', model: 'deepseek/deepseek-flash', args: ['--variant', 'high'] });
+  const expected = launchAttribution({ kind: 'opencode', model: 'deepseek/deepseek-flash', args: ['--variant', 'high', '--auto'] });
   expect(() => validateProvenance(compact, true, expected)).toThrow('known effort');
   expect(() => validateProvenance(compact.replace('effort=unknown', 'effort=high'), true, expected)).not.toThrow();
   expect(() => validateProvenance(trailers, true, expected)).toThrow('known effort');
@@ -112,7 +112,7 @@ for (const replacement of [false, true]) test(`known attribution gates new commi
   writeFileSync(join(root, '.gitignore'), '.shawshank/runs/\n');
   writeFileSync(join(root, '.shawshank/config.json'), JSON.stringify({
     project: { commitProvenance: true, commitTrailer: 'Co-Authored-By: <agent display name> <noreply@<provider domain>>' },
-    roles: { implementer: { standard: [{ kind: 'opencode', model: 'deepseek/deepseek-flash', args: ['--variant', 'high'] }] } },
+    roles: { implementer: { standard: [{ kind: 'opencode', model: 'deepseek/deepseek-flash', args: ['--variant', 'high', '--auto'] }] } },
   }));
   writeFileSync(join(root, 'brief.md'), 'Synthetic attribution fixture');
   writeFileSync(join(root, 'task.json'), JSON.stringify({ worktree: root, goal: 'Fixture', brief: 'brief.md',

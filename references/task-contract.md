@@ -75,9 +75,12 @@ add persistent permissions. Plan-linked briefs use run-local snapshots instead.
 Every OpenCode role therefore includes an explicit `--auto` in its args, in test
 and end-to-end fixture configurations as well as real ones. Without it, OpenCode V2
 asks for approval on nearly every dispatch, report and evidence access, and each
-prompt stalls the run. Omit it only for a test whose stated purpose is the
-permission-prompt path, with the user's agreement. `--auto` approves only requests
-that are not explicitly denied; it stays a configured arg, never an injected one.
+prompt stalls the run. Dispatch, replacement and final-run registration reject any
+OpenCode role they launch or snapshot for a later stage when it lacks `--auto`,
+before recording an attempt; there is no override. A retained worker that is only
+prompted again is not rechecked. `--auto` approves only
+requests that are not explicitly denied, so restrict workers with OpenCode deny
+rules rather than prompts. It stays a configured arg, never an injected one.
 
 ## Worker configuration
 

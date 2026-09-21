@@ -63,7 +63,7 @@ V2 requires Herdr's full-TUI lifecycle integration (tested with Herdr 0.9.1 and
 OpenCode 2.0.11); Mini is not a substitute. Install or upgrade only with authorization.
 Fix reported prerequisite mismatches explicitly; do not fall back to another transport.
 Always include `--auto` in every OpenCode role's args, including test and
-end-to-end fixture configurations; see
+end-to-end fixture configurations; dispatch rejects OpenCode roles without it. See
 [external-reference approval prompts](references/task-contract.md#external-reference-permissions)
 for what happens without it.
 
