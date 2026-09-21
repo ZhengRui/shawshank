@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, realpa
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { amendPlanScope, dispatchImplementation, takeOverPlan, acceptImplementation,
-  dispatchReview, acceptReview, recordTriage, dispatchRepair, preparePlanFinalReview } from './workflow';
+  dispatchReview, acceptReview, recordTriage, dispatchRepair, preparePlanFinalReview, resolveNoLaunch } from './workflow';
 import { HerdrError } from './herdr';
 
 const script = join(import.meta.dir, 'workflow.ts');
@@ -115,7 +115,7 @@ function amendmentFixture() {
   return { f, plan, run, decision, file, save, state };
 }
 
-for (const paused of [false, true]) test(`amended scope flows through repair, acceptance, re-review and final preparation (paused=${paused})`, async () => {
+for (const mode of ['normal', 'paused', 'no-launch']) test(`amended scope flows through repair, acceptance, re-review and final preparation (${mode})`, async () => {
   const f = fixture();
   const role = { kind: 'codex', model: 'fixture', args: [] };
   mkdirSync(join(f.root, '.shawshank'), { recursive: true });
@@ -160,11 +160,49 @@ for (const paused of [false, true]) test(`amended scope flows through repair, ac
   const triage = (attempt: any, action: string) => writeFileSync(decisionFile, JSON.stringify({ attempt_id: attempt.attempt_id,
     head_sha: f.git('rev-parse', 'HEAD'), decisions: [{ id: 'F1', action, evidence: 'Synthetic fixture decision' }] }));
   triage(review, 'fix'); await recordTriage(run, 'controller', decisionFile, call);
+  if (mode === 'no-launch') {
+    const db = new Database(f.database);
+    db.exec(`CREATE TRIGGER fixture_crash BEFORE UPDATE OF status ON attempts
+      WHEN NEW.status='prompting' BEGIN SELECT RAISE(ABORT,'fixture pre-prompt crash'); END`);
+    await expect(dispatchRepair(run, 'controller', call)).rejects.toThrow('fixture pre-prompt crash');
+    db.exec('DROP TRIGGER fixture_crash'); db.close();
+    const pending = state(), recoveryFile = join(f.inputs, 'no-launch.json');
+    expect(pending.attempts.at(-1).status).toBe('prepared');
+    expect(pending.attempts.at(-1).pane_id).toBe(first.pane);
+    writeFileSync(recoveryFile, JSON.stringify({ previous_controller: 'controller', stage: pending.run.stage,
+      attempt_id: pending.attempts.at(-1).id, head_sha: pending.observed_head,
+      worktree_fingerprint: pending.worktree_fingerprint, previous_command_stopped: true,
+      evidence: 'Synthetic dispatch returned after database failure.', session_evidence: 'Same fixture transport.',
+      resolution: 'no_launch', prompt_submitted: false,
+      non_submission_evidence: 'Database rejected the pre-prompt update; no prompt was sent for this attempt.',
+      retained_attempt_id: first.attempt_id, retained_worker_evidence: 'Same accepted fixture worker; no active writers.',
+      no_session_created: true, session_creation_evidence: 'Retained session; no launch occurred.' }));
+    await resolveNoLaunch(run, 'controller', recoveryFile, call);
+    expect(state().run.stage).toBe('repair_required');
+    expect(state().run.repair_count).toBe(0);
+    expect(state().attempts.at(-1)).toMatchObject({ status: 'no_launch', cleanup_state: 'closed', pane_id: first.pane });
+  }
   const oldTask = readFileSync(join(run, 'task.json'), 'utf8');
   const planState = JSON.parse(cli('plan-status', plan).out), amendFile = join(f.inputs, 'scope.json');
   writeFileSync(amendFile, JSON.stringify({ plan_id: planState.plan.id, run_id: state().run.id,
     plan_fingerprint: planState.recovery_fingerprint, head_sha: f.git('rev-parse', 'HEAD'),
     add_paths: ['existing.test.ts'], reason: 'Omitted existing test', authorization: 'Synthetic approved test scope', within_approved_plan: true }));
+  if (mode === 'no-launch') {
+    const before = state(), planBefore = JSON.parse(cli('plan-status', plan).out);
+    const original = { ...agents.get(first.worker) };
+    for (const invalid of [{ agent_status: 'working' }, { agent_status: 'blocked' },
+      { cwd: f.inputs }, { foreground_cwd: f.inputs }, null]) {
+      if (invalid) agents.set(first.worker, { ...original, ...invalid });
+      else agents.delete(first.worker);
+      const offset = calls.length;
+      await expect(amendPlanScope(plan, 'controller', amendFile, call)).rejects.toThrow();
+      expect(calls.slice(offset)).toContainEqual(['agent', 'get', first.worker]);
+      expect(state().run).toEqual(before.run);
+      expect(state().attempts).toEqual(before.attempts);
+      expect(JSON.parse(cli('plan-status', plan).out).recovery_fingerprint).toBe(planBefore.recovery_fingerprint);
+    }
+    agents.set(first.worker, original);
+  }
   await amendPlanScope(plan, 'controller', amendFile, call);
   const repair = await dispatchRepair(run, 'controller', call);
   const repairState = state(), prompt = readFileSync(repairState.attempts.at(-1).dispatch_path, 'utf8');
@@ -173,7 +211,7 @@ for (const paused of [false, true]) test(`amended scope flows through repair, ac
   expect(prompt).toContain(current.brief);
   expect(readFileSync(current.brief, 'utf8')).toContain('Authorized scope correction');
   expect(repair.worker).toBe(first.worker);
-  if (paused) {
+  if (mode === 'paused') {
     // Reproduce the historical bad dispatch without rewriting it during recovery.
     const dispatch = repairState.attempts.at(-1).dispatch_path;
     writeFileSync(dispatch, '# Synthetic legacy stale dispatch\n' + oldTask);

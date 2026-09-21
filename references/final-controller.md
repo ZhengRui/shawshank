@@ -83,8 +83,10 @@ derive it from shared configuration.
    artifacts are preserved; cleanup failure does not erase the review outcome.
 
 For startup failure, invalid reports or an exited reviewer, read
-[recovery.md](recovery.md) before acting. Final-run takeover and replacement
-remain unsupported; do not apply task recovery commands or adopt an old owner ID.
+[recovery.md](recovery.md) before acting. The same owner may use replace-worker
+for an interrupted final reviewer, repairer or verifier before report delivery;
+this preserves the selected role, pinned revisions and all budgets. Final-run
+takeover remains unsupported; never adopt an old owner ID.
 
 Use the schema pinned by the saved dispatch when resuming an existing run;
 never rewrite accepted reports to match a newer format.

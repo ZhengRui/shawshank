@@ -1,7 +1,7 @@
 import { test, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync, realpathSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, realpathSync, readFileSync, renameSync } from 'node:fs';
 import { acceptImplementation, dispatchImplementation, dispatchReview, acceptReview, recordTriage, dispatchRepair, correctReport, cleanupWorkers, takeOver, replaceWorker, dispatchFinalReview, acceptFinalReview, recordFinalTriage, dispatchFinalWork, acceptFinalWork, completeFinalReview } from './workflow';
 import { HerdrError } from './herdr';
 import { startupError } from './startup';
@@ -494,6 +494,90 @@ async function finalLoopFixture(findings: any[] = [{ id: 'F1', severity: 'major'
   };
   return { ...f, run, call, calls, panes, observe, triage, repair, verify };
 }
+
+const replacementEvidence = { worker_stopped: true,
+  worker_stop_evidence: 'Synthetic worker settled; all commands and background writers stopped.',
+  partial_work: 'Preserve prior work and finish only the interrupted contract.' };
+
+test('final reviewer replacement preserves scope and accepts delivery without reopening accepted review', async () => {
+  const f = await finalDispatchFixture();
+  const first = await f.dispatch();
+  const decide = (extra = {}) => recoveryDecision(f.run, { ...replacementEvidence, ...extra });
+  await expect(replaceWorker(f.run, 'other', decide(), f.call)).rejects.toThrow('Controller');
+  await expect(takeOver(f.run, 'other', decide(), f.call)).rejects.toThrow('Wrong run kind');
+  await expect(replaceWorker(f.run, 'final-controller', decide({ worker_index: 0 }), f.call)).rejects.toThrow('selected role');
+  writeFileSync(first.report, '{}');
+  await expect(replaceWorker(f.run, 'final-controller', decide(), f.call)).rejects.toThrow('report exists');
+  // Move the partial report to retained evidence, modelling operator inspection.
+  renameSync(first.report, join(f.run, 'inspected-partial-report.json'));
+  writeFileSync(join(f.root, 'sample.ts'), 'unexpected reviewer edit');
+  await expect(replaceWorker(f.run, 'final-controller', decide(), f.call)).rejects.toThrow('clean');
+  // Preserve the observation in ignored run evidence, restoring fixture contents only.
+  renameSync(join(f.root, 'sample.ts'), join(f.run, 'unexpected-edit.txt'));
+  let agent: any;
+  const transport = async (...args: string[]) => {
+    if (args[1] === 'split') return { pane: { pane_id: 'replacement-pane', tab_id: 'test-tab' } };
+    if (args[1] === 'start') agent = { name: args[2], agent: args[4], pane_id: 'replacement-pane',
+      tab_id: 'test-tab', agent_status: 'idle', cwd: f.root, foreground_cwd: f.root };
+    if (args[0] === 'agent' && agent) return { agent };
+    if (args[0] === 'pane' && args[2] === 'replacement-pane' && args[1] === 'get')
+      throw new HerdrError('Closed fixture replacement', 'pane_not_found');
+    return f.call(...args);
+  };
+  const replacement = await replaceWorker(f.run, 'final-controller', decide(), transport);
+  const state = JSON.parse(cli('status', f.run).out);
+  expect(state.run.stage).toBe('final_reviewing');
+  expect(state.run.repair_count).toBe(0);
+  expect(state.attempts[0].status).toBe('replaced');
+  expect(state.attempts[1].base_sha).toBe(state.attempts[0].base_sha);
+  expect(state.attempts[1].head_sha).toBe(state.attempts[0].head_sha);
+  writeFileSync(replacement.report, JSON.stringify({ attempt_id: replacement.attempt_id,
+    base_sha: f.finalInput.base, head_sha: f.finalInput.reviewedHEAD, evidence: 'Synthetic replacement review',
+    findings: [], ...finalCoverageFixture(f) }));
+  expect((await acceptFinalReview(f.run, 'final-controller', transport)).stage).toBe('review_reported');
+  await expect(replaceWorker(f.run, 'final-controller', decide(), transport)).rejects.toThrow('outstanding attempt');
+});
+
+test('final repair and verifier replacement preserve relationships, partial work and round budget', async () => {
+  const f = await finalLoopFixture();
+  f.triage([{ id: 'F1', action: 'fix', evidence: 'Synthetic defect' }]);
+  const first = await dispatchFinalWork(f.run, 'final-controller', 'repair', f.call);
+  const baseline = f.observe().run.accepted_head;
+  const reviewID = f.observe().attempts[0].id;
+  writeFileSync(join(f.root, 'sample.ts'), 'export const repaired = 1;\n');
+  f.git('add', 'sample.ts');
+  f.git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null',
+    'commit', '-qm', 'Partial repair\n\nCo-Authored-By: Test <noreply@test.invalid>');
+  writeFileSync(join(f.root, 'sample.ts'), 'export const repaired = 2;\n');
+  const before = f.observe();
+  await expect(replaceWorker(f.run, 'final-controller', recoveryDecision(f.run, replacementEvidence), async (...args) => {
+    if (args[1] === 'start') {
+      await f.call(...args);
+      throw new HerdrError('Fixture approval', 'agent_not_ready');
+    }
+    return f.call(...args);
+  })).rejects.toThrow('Fixture approval');
+  const repaired = await dispatchFinalWork(f.run, 'final-controller', 'repair', f.call);
+  expect(f.observe().worktree_fingerprint).toBe(before.worktree_fingerprint);
+  expect(f.observe().run.repair_count).toBe(1);
+  expect(f.observe().attempts.find((a: any) => a.id === first.attempt_id).status).toBe('replaced');
+  f.git('add', 'sample.ts');
+  f.git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null',
+    'commit', '-qm', 'Finish repair\n\nCo-Authored-By: Test <noreply@test.invalid>');
+  const head = f.observe().observed_head;
+  writeFileSync(repaired.report, JSON.stringify({ attempt_id: repaired.attempt_id, review_id: reviewID, round: 1,
+    base_sha: baseline, head_sha: head, status: 'DONE', evidence: 'Synthetic repaired delivery', addressed_ids: ['F1'],
+    checks: [{ requirement: 'fixture test', status: 'PASS', evidence: 'Synthetic test' }] }));
+  await acceptFinalWork(f.run, 'final-controller', 'repair', f.call);
+  const verifier = await dispatchFinalWork(f.run, 'final-controller', 'verification', f.call);
+  const next = await replaceWorker(f.run, 'final-controller', recoveryDecision(f.run, replacementEvidence), f.call);
+  expect(f.observe().attempts.find((a: any) => a.id === verifier.attempt_id).status).toBe('replaced');
+  expect(f.observe().run.repair_count).toBe(1);
+  writeFileSync(next.report, JSON.stringify({ attempt_id: next.attempt_id, review_id: reviewID,
+    repair_id: repaired.attempt_id, round: 1, base_sha: head, head_sha: head, evidence: 'Synthetic verification',
+    results: [{ id: 'F1', status: 'PASS', evidence: 'Synthetic check' }], regressions: [], coverage: finalCoverageFixture(f).coverage }));
+  expect((await acceptFinalWork(f.run, 'final-controller', 'verification', f.call)).stage).toBe('final_completion_ready');
+});
 
 test('final repair commit correction preserves evidence and repair budget before verification', async () => {
   const f = await finalLoopFixture();
@@ -1064,8 +1148,16 @@ test('no-launch recovery releases task startup without replay and permits a fres
   expect(result.stage).toBe('registered');
   expect(f.prompts()).toBe(0);
   expect(readFileSync(original.dispatch_path, 'utf8')).toBe(dispatch);
+  const saved = JSON.parse(JSON.parse(cli('status', f.registered.run).out).run.config_json).lastNoLaunchDecision;
+  const db = new Database(join(f.root, '.shawshank/runs/workflow.sqlite'));
+  const config = JSON.parse((db.query('SELECT config_json FROM runs').get() as any).config_json);
+  db.query('UPDATE runs SET config_json=?').run(JSON.stringify({ ...config, reusePane: true, controllerPane: 'stale' }));
+  db.close();
   await dispatchImplementation(f.registered.run, 'a', 'root', 'test', f.transport);
   const state = JSON.parse(cli('status', f.registered.run).out);
+  expect(JSON.parse(state.run.config_json).lastNoLaunchDecision).toBe(saved);
+  expect(JSON.parse(state.run.config_json)).not.toHaveProperty('reusePane');
+  expect(JSON.parse(state.run.config_json)).not.toHaveProperty('controllerPane');
   expect(state.attempts.map((a: any) => a.status)).toEqual(['no_launch', 'submitted']);
   expect(f.prompts()).toBe(1);
   await expect(resolveNoLaunch(f.registered.run, 'a', decide(), absentLaunch)).rejects.toThrow('No prepared dispatch');
@@ -1270,6 +1362,79 @@ test('known unused sessions require OpenCode identity; other workers need no-ses
     }
   }
 });
+
+for (const action of ['task-repair', 'task-rereview', 'final-repair']) {
+test(`no-launch releases only the unprompted retained dispatch: ${action}`, async () => {
+  let root: string, run: string, owner: string, call: (...args: string[]) => Promise<any>, dispatch: () => Promise<any>;
+  if (action === 'final-repair') {
+    const f = await finalLoopFixture();
+    f.triage([{ id: 'F1', action: 'fix', evidence: 'Synthetic finding' }]);
+    const r = await f.repair(1);
+    await acceptFinalWork(f.run, 'final-controller', 'repair', f.call);
+    await f.verify(r, 'FAIL');
+    await acceptFinalWork(f.run, 'final-controller', 'verification', f.call);
+    f.triage([{ id: 'F1', action: 'fix', evidence: 'Synthetic remaining finding' }]);
+    root = f.root; run = f.run; owner = 'final-controller'; call = f.call;
+    dispatch = () => dispatchFinalWork(run, owner, 'repair', call);
+  } else {
+    const f = await lifecycleFixture(true);
+    await recordTriage(f.registered.run, 'a', f.decision, f.reviewTransport);
+    root = f.root; run = f.registered.run; owner = 'a'; call = f.reviewTransport;
+    if (action === 'task-rereview') {
+      const r = await dispatchRepair(run, owner, call);
+      writeFileSync(join(root, 'sample.ts'), 'export const answer = 43;\n'); f.commit();
+      const head = JSON.parse(cli('status', run).out).observed_head;
+      writeFileSync(r.report, JSON.stringify({ attempt_id: r.attempt_id, base_sha: f.registered.base_sha,
+        head_sha: head, status: 'DONE', concerns: [], checks: [{ requirement: f.task.acceptance[0],
+          status: 'PASS', evidence: { command: 'Synthetic test', result: 'passed' } }] }));
+      await acceptImplementation(run, owner, call);
+      dispatch = () => dispatchReview(run, owner, call);
+    } else dispatch = () => dispatchRepair(run, owner, call);
+  }
+  const observe = () => JSON.parse(cli('status', run).out);
+  const before = observe();
+  const db = new Database(join(root, '.shawshank/runs/workflow.sqlite'));
+  // Fail the durable pre-prompt update after the prepared intent is committed.
+  db.exec(`CREATE TRIGGER fixture_crash BEFORE UPDATE OF status ON attempts
+    WHEN NEW.status IN ('prompting','startup_blocked') BEGIN SELECT RAISE(ABORT,'fixture pre-prompt crash'); END`);
+  await expect(dispatch()).rejects.toThrow('fixture pre-prompt crash');
+  db.exec('DROP TRIGGER fixture_crash');
+  const pending = observe().attempts.at(-1);
+  const prior = before.attempts.findLast((a: any) => a.worker_name === pending.worker_name);
+  expect(pending.status).toBe('prepared');
+  const evidence = { resolution: 'no_launch', prompt_submitted: false,
+    non_submission_evidence: 'Injected database failure before any prompt call for THIS attempt.',
+    retained_attempt_id: prior.id, retained_worker_evidence: 'Same synthetic worker, no active command or writer.',
+    no_session_created: true, session_creation_evidence: 'Existing accepted session reused; no start called.' };
+  for (const extra of [{ retained_attempt_id: 'wrong' }, { retained_worker_evidence: '' },
+    { non_submission_evidence: '' }, { previous_command_stopped: false }, { prompt_submitted: true }]) {
+    await expect(resolveNoLaunch(run, owner, recoveryDecision(run, { ...evidence, ...extra }), call)).rejects.toThrow();
+  }
+  for (const live of [{ agent_status: 'working' }, { agent_status: 'blocked' }, { pane_id: 'other' }, { cwd: '/' }]) {
+    await expect(resolveNoLaunch(run, owner, recoveryDecision(run, evidence), async (...args) => {
+      const result = await call(...args); return { ...result, agent: { ...result.agent, ...live } };
+    })).rejects.toThrow();
+  }
+  db.query("UPDATE attempts SET status='prompting' WHERE id=?").run(pending.id);
+  await expect(resolveNoLaunch(run, owner, recoveryDecision(run, evidence), call)).rejects.toThrow('No prepared dispatch');
+  db.query("UPDATE attempts SET status='prepared' WHERE id=?").run(pending.id);
+  db.close();
+  let reads = 0;
+  await resolveNoLaunch(run, owner, recoveryDecision(run, evidence), async (...args) => {
+    expect(args.slice(0, 2)).toEqual(['agent', 'get']); reads++; return call(...args);
+  });
+  const after = observe();
+  expect(reads).toBe(1);
+  expect(after.run.stage).toBe(before.run.stage);
+  expect(after.run.repair_count).toBe(before.run.repair_count);
+  expect(after.attempts.find((a: any) => a.id === prior.id)).toEqual(prior);
+  expect(after.attempts.at(-1).status).toBe('no_launch');
+  const resumed = await dispatch();
+  expect(resumed.worker).toBe(prior.worker_name);
+  expect(resumed.pane).toBe(prior.pane_id);
+  expect(observe().run.repair_count).toBe(before.run.repair_count + (action === 'task-rereview' ? 0 : 1));
+});
+}
 
 test('same no-launch resolution covers all task and final dispatch stages with bounded repair reservations', async () => {
   const cases = [
