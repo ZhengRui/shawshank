@@ -4,7 +4,8 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, realpa
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { amendPlanScope, dispatchImplementation, takeOverPlan, acceptImplementation,
-  dispatchReview, acceptReview, recordTriage, dispatchRepair, preparePlanFinalReview, resolveNoLaunch } from './workflow';
+  dispatchReview, acceptReview, recordTriage, dispatchRepair, preparePlanFinalReview, resolveNoLaunch,
+  retirePlan } from './workflow';
 import { HerdrError } from './herdr';
 
 const script = join(import.meta.dir, 'workflow.ts');
@@ -851,6 +852,29 @@ test('failed association insert rolls back the whole plan registration', () => {
   expect(f.register().code).toBe(0);
 });
 
+test('plan commands migrate a ledger written before retirement existed', () => {
+  const f = fixture();
+  const plan = JSON.parse(cli('register-plan', f.path, '--controller', 'controller').out).plan;
+  // Reproduce a pre-migration ledger: availableWorktree consults retired_at, so
+  // every path reaching it must add the columns first, not only register/openRun.
+  const db = new Database(f.database);
+  db.exec('DROP INDEX IF EXISTS one_active_run_per_worktree');
+  for (const table of ['plans', 'runs'])
+    for (const column of ['retired_at', 'retired_reason'])
+      db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+  expect((db.query('PRAGMA table_info(plans)').all() as any[]).some(c => c.name === 'retired_at')).toBe(false);
+  db.close();
+
+  const prepared = prepare(f, plan);
+  expect(prepared.code).toBe(0);
+  const migrated = new Database(f.database, { readonly: true });
+  for (const table of ['plans', 'runs'])
+    expect((migrated.query(`PRAGMA table_info(${table})`).all() as any[])
+      .filter(c => ['retired_at', 'retired_reason'].includes(c.name)).length).toBe(2);
+  migrated.close();
+  expect(JSON.parse(cli('plan-status', plan).out).plan.retired_at ?? null).toBeNull();
+});
+
 test('plan status derives linked progress from runs without copying it', () => {
   const f = fixture();
   const run = JSON.parse(cli('register-task', f.taskPath, '--controller', 'fixture').out).run;
@@ -867,4 +891,127 @@ test('plan status derives linked progress from runs without copying it', () => {
   expect(readFileSync(f.database).equals(before)).toBe(true);
   expect(db.query('PRAGMA table_info(plan_tasks)').all().some((c: any) => c.name === 'stage')).toBe(false);
   db.close();
+});
+
+function retirementDecision(f: ReturnType<typeof fixture>, plan: string, extra: Record<string, unknown> = {}) {
+  const state = JSON.parse(cli('plan-status', plan).out);
+  const unfinished = [...state.tasks.filter((t: any) => t.run_id && t.stage !== 'task_passed')
+    .map((t: any) => ({ run_id: t.run_id, stage: t.stage })),
+    ...(state.final_run && !['review_reported', 'final_passed'].includes(state.final_run.stage)
+      ? [{ run_id: state.final_run.id, stage: state.final_run.stage }] : [])];
+  return { plan_id: state.plan.id, plan_fingerprint: state.recovery_fingerprint,
+    head_sha: f.git('rev-parse', 'HEAD'), unreachable: true,
+    reason: 'Final verifier role is unobtainable and final replacement may not substitute it',
+    authorization: 'User authorized retiring this plan in the handoff conversation',
+    retire_runs: unfinished, ...extra };
+}
+const absent = async (...args: string[]): Promise<any> => {
+  if (args[0] === 'pane' && args[1] === 'get') throw new HerdrError('Fixture absent', 'pane_not_found');
+  throw new Error(`Unexpected call ${args.join(' ')}`);
+};
+
+test('retirement releases the worktree and lets an independent plan register', async () => {
+  const f = fixture();
+  const plan = JSON.parse(f.register().out).plan;
+  const run = JSON.parse(prepare(f, plan).out).run;
+  // A registered-but-unfinished plan reserves the directory, whatever the work is about.
+  expect(f.register().error).toContain('unfinished plan');
+  const decisionPath = join(f.inputs, 'retire.json');
+  writeFileSync(decisionPath, JSON.stringify(retirementDecision(f, plan)));
+  const result = await retirePlan(plan, 'new-controller', decisionPath, absent);
+  expect(result.worktree).toBe('released');
+  expect(result.retired_runs).toEqual([{ run_id: run.slice(run.lastIndexOf('/') + 1), stage: 'registered' }]);
+  const status = JSON.parse(cli('plan-status', plan).out);
+  expect(status.next_action.action).toBe('plan_retired');
+  expect(status.plan.retired_at).toBe(result.retired_at);
+  // History is preserved exactly: stages, links and inputs are untouched.
+  expect(status.tasks[0].stage).toBe('registered');
+  expect(status.tasks[0].run_id).toBe(run.slice(run.lastIndexOf('/') + 1));
+  expect(JSON.parse(readFileSync(result.record, 'utf8')).authorization).toContain('User authorized');
+  expect(f.register().code).toBe(0);
+  expect(f.git('status', '--porcelain')).toBe('');
+});
+
+test('a retired plan and its runs are closed to every further command', async () => {
+  const f = fixture();
+  const plan = JSON.parse(f.register().out).plan;
+  const run = JSON.parse(prepare(f, plan).out).run;
+  const decisionPath = join(f.inputs, 'retire.json');
+  writeFileSync(decisionPath, JSON.stringify(retirementDecision(f, plan)));
+  await retirePlan(plan, 'new-controller', decisionPath, absent);
+  // Read-only inspection still works and says so; mutation does not.
+  expect(JSON.parse(cli('status', run).out).next_action).toContain('run_retired');
+  expect(cli('dispatch-implementation', run, '--controller', 'controller',
+    '--pane', 'parent', '--tab', 'test-tab').error).toContain('Run is retired');
+  expect(prepare(f, plan, 'second').error).toContain('Plan is retired');
+  expect(cli('prepare-plan-final-review', plan, '--controller', 'controller').error).toContain('Plan is retired');
+  writeFileSync(decisionPath, JSON.stringify(retirementDecision(f, plan)));
+  expect(await retirePlan(plan, 'new-controller', decisionPath, absent)
+    .then(() => 'resolved').catch((e: Error) => e.message)).toContain('already retired');
+});
+
+test('retirement refuses weak evidence, a live pane and a dirty tree', async () => {
+  const f = fixture();
+  const plan = JSON.parse(f.register().out).plan;
+  prepare(f, plan);
+  const decisionPath = join(f.inputs, 'retire.json');
+  const attempt = async (extra: Record<string, unknown>, call = absent) => {
+    writeFileSync(decisionPath, JSON.stringify(retirementDecision(f, plan, extra)));
+    return retirePlan(plan, 'new-controller', decisionPath, call)
+      .then(() => 'resolved').catch((error: Error) => error.message);
+  };
+  expect(await attempt({ unreachable: false })).toContain('unreachable:true');
+  expect(await attempt({ reason: '' })).toContain('reason');
+  expect(await attempt({ authorization: '' })).toContain('authorization');
+  expect(await attempt({ plan_fingerprint: 'stale' })).toContain('stale');
+  expect(await attempt({ plan_id: 'other' })).toContain('different plan');
+  expect(await attempt({ head_sha: 'f'.repeat(40) })).toContain('Git state changed');
+  // Omitting an unfinished run from the enumeration must not silently retire it.
+  expect(await attempt({ retire_runs: [] })).toContain('match the unfinished linked runs');
+  writeFileSync(join(f.root, 'stray.txt'), 'uncommitted');
+  expect(await attempt({})).toContain('not clean');
+  unlinkSync(join(f.root, 'stray.txt'));
+  expect(JSON.parse(cli('plan-status', plan).out).plan.retired_at ?? null).toBeNull();
+  expect(await attempt({})).toBe('resolved');
+});
+
+test('retirement never kills a live worker pane and closes only confirmed-absent ones', async () => {
+  const f = fixture();
+  const role = { kind: 'codex', model: 'fixture-only', args: [] };
+  mkdirSync(join(f.root, '.shawshank'), { recursive: true });
+  writeFileSync(join(f.root, '.shawshank/config.json'), JSON.stringify({ project: { commitTrailer: 'Fixture trailer' },
+    roles: { implementer: { standard: [role] }, taskReviewer: role } }));
+  f.git('add', '.');
+  f.git('-c', 'user.name=Fixture', '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'Configure fixture');
+  const plan = JSON.parse(f.register().out).plan;
+  const run = JSON.parse(prepare(f, plan).out).run;
+  const agents = new Map<string, any>();
+  await dispatchImplementation(run, 'controller', 'parent', 'test-tab', async (...args: string[]): Promise<any> => {
+    if (args[0] === 'pane' && args[1] === 'split') return { pane: { pane_id: 'worker-pane', tab_id: 'test-tab' } };
+    if (args[0] === 'pane') return { pane: { pane_id: args[2], tab_id: 'test-tab' } };
+    if (args[1] === 'start') agents.set(args[2], { name: args[2], pane_id: 'worker-pane', tab_id: 'test-tab',
+      agent: 'codex', agent_status: 'idle', cwd: f.root, foreground_cwd: f.root });
+    const agent = agents.get(args[2]);
+    if (!agent) throw new HerdrError('Fixture absent', 'agent_not_found');
+    return { agent };
+  });
+  const decisionPath = join(f.inputs, 'retire.json');
+  writeFileSync(decisionPath, JSON.stringify(retirementDecision(f, plan)));
+  const seen: string[][] = [];
+  const live = async (...args: string[]): Promise<any> => {
+    seen.push(args);
+    if (args[0] === 'pane' && args[1] === 'get') return { pane: { pane_id: args[2], tab_id: 'test-tab' } };
+    throw new Error(`Unexpected call ${args.join(' ')}`);
+  };
+  await expect(retirePlan(plan, 'new-controller', decisionPath, live)).rejects.toThrow('still exists');
+  // The live pane was inspected, never closed or prompted.
+  expect(seen.every(args => args[1] === 'get')).toBe(true);
+  expect(JSON.parse(cli('plan-status', plan).out).plan.retired_at ?? null).toBeNull();
+  const result = await retirePlan(plan, 'new-controller', decisionPath, absent);
+  expect(result.closed_panes).toEqual(['worker-pane']);
+  const db = new Database(f.database, { readonly: true });
+  expect((db.query('SELECT cleanup_state, cleanup_error FROM attempts').all() as any[])
+    .every(a => a.cleanup_state === 'closed' && /absent at plan retirement/.test(a.cleanup_error))).toBe(true);
+  db.close();
+  expect(f.register().code).toBe(0);
 });

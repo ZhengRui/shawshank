@@ -84,11 +84,38 @@ function initialize(database: string): Database {
       run_id TEXT UNIQUE REFERENCES runs(id),
       PRIMARY KEY(plan_id, task_key), UNIQUE(plan_id, position)
     );`);
+    retirementSchema(db);
   } catch (error) { db.close(); throw error; }
   return db;
 }
 
-const terminalStages = "'task_passed','review_reported','final_passed'";
+const terminalStageList = ['task_passed', 'review_reported', 'final_passed'];
+const terminalStages = terminalStageList.map(stage => `'${stage}'`).join(',');
+
+// Retirement is an additive marker, never a stage. A retired plan keeps every
+// stage, report, decision, counter and commit exactly as delivered; only the
+// worktree reservation is released. Nothing reads a retired row as accepted
+// work, and no retired run can be dispatched, accepted or resumed again.
+function retirementSchema(db: Database) {
+  db.transaction(() => {
+    for (const table of ['plans', 'runs']) {
+      if (!db.query(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table)) continue;
+      const columns = db.query(`PRAGMA table_info(${table})`).all() as any[];
+      for (const name of ['retired_at', 'retired_reason'])
+        if (!columns.some(c => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} TEXT`);
+    }
+    const index = db.query(`SELECT sql FROM sqlite_master WHERE type='index'
+      AND name='one_active_run_per_worktree'`).get() as any;
+    if (index?.sql && !/retired_at/.test(index.sql))
+      db.exec(`DROP INDEX one_active_run_per_worktree;
+        CREATE UNIQUE INDEX one_active_run_per_worktree ON runs(worktree_path)
+        WHERE stage NOT IN (${terminalStages}) AND retired_at IS NULL`);
+  }).immediate();
+}
+
+function retired(row: any): boolean {
+  return Boolean(row && 'retired_at' in row && row.retired_at);
+}
 
 function finalSchema(db: Database) {
   db.transaction(() => {
@@ -113,15 +140,20 @@ function finalSchema(db: Database) {
 }
 
 function availableWorktree(db: Database, worktree: string, owningPlan = '') {
+  // A retired plan or run no longer reserves the worktree. Its rows stay fully
+  // readable; they are only excluded from the "still owns this directory" tests.
   if (db.query(`SELECT p.id FROM plans p LEFT JOIN runs r ON r.id=p.final_run_id
-    WHERE p.worktree_path=? AND p.id!=? AND (r.id IS NULL OR r.stage!='final_passed' OR EXISTS (
+    WHERE p.worktree_path=? AND p.id!=? AND p.retired_at IS NULL
+    AND (r.id IS NULL OR r.stage!='final_passed' OR EXISTS (
       SELECT 1 FROM attempts a WHERE a.run_id=r.id AND a.pane_id IS NOT NULL
       AND COALESCE(a.cleanup_state,'')!='closed')) LIMIT 1`).get(worktree, owningPlan))
     throw new Error('An unfinished plan already owns this worktree');
-  if (db.query(`SELECT id FROM runs WHERE worktree_path=? AND stage NOT IN (${terminalStages})`).get(worktree))
+  if (db.query(`SELECT id FROM runs WHERE worktree_path=? AND retired_at IS NULL
+    AND stage NOT IN (${terminalStages})`).get(worktree))
     throw new Error('An unfinished run already owns this worktree');
   if (db.query(`SELECT a.id FROM attempts a JOIN runs r ON r.id=a.run_id
-    WHERE r.worktree_path=? AND a.pane_id IS NOT NULL AND COALESCE(a.cleanup_state,'')!='closed' LIMIT 1`).get(worktree))
+    WHERE r.worktree_path=? AND r.retired_at IS NULL AND a.pane_id IS NOT NULL
+    AND COALESCE(a.cleanup_state,'')!='closed' LIMIT 1`).get(worktree))
     throw new Error('Previous run still has pending worker cleanup');
 }
 
@@ -355,7 +387,9 @@ export function planStatus(planPath: string) {
     const finalCleanup = final ? cleanupSummary(db, final) : null;
     return { plan, tasks, recovery_fingerprint: planFingerprint(db, id), adjustments_path: join(path, 'adjustments.md'),
       final_run: final, final_cleanup: finalCleanup,
-      next_action: next ? { task_key: next.task_key, action: !next.run_id ? 'prepare_task'
+      next_action: retired(plan) ? { action: 'plan_retired', retired_at: plan.retired_at,
+        reason: plan.retired_reason }
+        : next ? { task_key: next.task_key, action: !next.run_id ? 'prepare_task'
         : next.stage !== 'task_passed' ? 'resume_task' : 'cleanup_task' }
         : { action: !final ? 'prepare_final_review' : final.stage !== 'final_passed' ? 'resume_final_review'
           : finalCleanup?.state === 'pending' ? 'cleanup_final_review' : 'plan_complete' },
@@ -370,6 +404,7 @@ export async function amendPlanScope(planPath: string, controller: string, decis
   try {
     const plan = db.query('SELECT * FROM plans WHERE id=?').get(id) as any;
     if (!plan || dirname(plan.input_path) !== path) throw new Error('Plan not found');
+    if (retired(plan)) throw new Error('Plan is retired; register a new plan instead of reusing it');
     if (plan.controller_id !== controller) throw new Error('Controller does not own this plan');
     if (plan.final_run_id) throw new Error('Scope amendment after final registration is not supported');
     const raw = readFileSync(decisionFile, 'utf8'), decision = JSON.parse(raw);
@@ -469,8 +504,10 @@ export async function takeOverPlan(planPath: string, controller: string, decisio
   const db = new Database(join(dirname(path), 'workflow.sqlite'), { readwrite: true });
   db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
   try {
+    retirementSchema(db);
     const plan = db.query('SELECT * FROM plans WHERE id=?').get(id) as any;
     if (!plan || dirname(plan.input_path) !== path) throw new Error('Plan not found');
+    if (retired(plan)) throw new Error('Plan is retired; register a new plan instead of reusing it');
     const decision = JSON.parse(readFileSync(decisionFile, 'utf8'));
     planRecoveryDecision(db, plan, decision);
     const tasks = db.query('SELECT * FROM plan_tasks WHERE plan_id=? ORDER BY position').all(id) as any[];
@@ -491,6 +528,99 @@ export async function takeOverPlan(planPath: string, controller: string, decisio
       writeFileSync(join(path, `takeover-${randomUUID()}.json`), JSON.stringify({ ...decision, new_controller: controller }, null, 2), { flag: 'wx' });
       transferPlanOwner(db, current, controller);
       return { plan: path, controller, stage: 'between_tasks', resolution: 'retain' };
+    }).immediate();
+  } finally { db.close(); }
+}
+
+function linkedRuns(db: Database, plan: any) {
+  const tasks = db.query(`SELECT r.* FROM runs r JOIN plan_tasks t ON t.run_id=r.id
+    WHERE t.plan_id=? ORDER BY t.position`).all(plan.id) as any[];
+  const final = plan.final_run_id
+    ? db.query('SELECT * FROM runs WHERE id=?').get(plan.final_run_id) as any : null;
+  return final ? [...tasks, final] : tasks;
+}
+
+// Retire a plan that provably cannot reach final_passed, releasing its worktree
+// reservation. This abandons the plan; it never accepts, advances, reopens or
+// rewrites any of its work. Use it when no supported transition remains — for
+// example an interrupted final run whose snapshotted role is unobtainable,
+// which final replacement may not substitute. Not a recovery path: a plan that
+// can still be resumed or taken over must be, not retired.
+export async function retirePlan(planPath: string, controller: string, decisionFile: string, call: HerdrCall = herdr) {
+  required(controller, 'controller');
+  const path = realpathSync(planPath), id = path.slice(path.lastIndexOf('/') + 1);
+  const db = new Database(join(dirname(path), 'workflow.sqlite'), { readwrite: true });
+  db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
+  try {
+    cleanupSchema(db);
+    retirementSchema(db);
+    const plan = db.query('SELECT * FROM plans WHERE id=?').get(id) as any;
+    if (!plan || dirname(plan.input_path) !== path) throw new Error('Plan not found');
+    if (retired(plan)) throw new Error('Plan is already retired');
+    const decision = JSON.parse(readFileSync(decisionFile, 'utf8'));
+    if (decision.plan_id !== plan.id) throw new Error('Retirement decision names a different plan');
+    if (decision.unreachable !== true)
+      throw new Error('Retirement requires an explicit unreachable:true assertion');
+    required(decision.reason, 'reason this plan cannot reach final_passed');
+    required(decision.authorization, 'user authorization for retirement');
+    required(decision.head_sha, 'head_sha');
+    if (decision.plan_fingerprint !== planFingerprint(db, plan.id))
+      throw new Error('Retirement evidence is stale');
+
+    // Enumerating every unfinished run by id AND current stage is the evidence
+    // that the operator read the live ledger rather than copying a hash.
+    const linked = linkedRuns(db, plan);
+    const unfinished = linked.filter(run => !terminalStageList.includes(run.stage));
+    const declared = decision.retire_runs;
+    if (!Array.isArray(declared) || declared.some((entry: any) =>
+      typeof entry?.run_id !== 'string' || typeof entry?.stage !== 'string'))
+      throw new Error('retire_runs must list {run_id, stage} for every unfinished linked run');
+    const shape = (items: any[]) => JSON.stringify(items.map(i => `${i.run_id ?? i.id}@${i.stage}`).sort());
+    if (shape(declared) !== shape(unfinished))
+      throw new Error('retire_runs must match the unfinished linked runs exactly, by id and current stage');
+
+    // Retirement closes pane bookkeeping only for panes Herdr confirms are gone.
+    // A live worker is never killed here: stop it first and inspect its output.
+    const ids = linked.map(run => run.id);
+    const panes = ids.length ? (db.query(`SELECT DISTINCT pane_id FROM attempts
+      WHERE pane_id IS NOT NULL AND COALESCE(cleanup_state,'')!='closed'
+      AND run_id IN (${ids.map(() => '?').join(',')})`).all(...ids) as any[]).map(row => row.pane_id) : [];
+    for (const pane of panes) {
+      let present: any = null;
+      try { present = (await call('pane', 'get', pane)).pane; }
+      catch (error) {
+        if (!(error instanceof HerdrError) || error.code !== 'pane_not_found') throw error;
+      }
+      if (present) throw new Error(`Worker pane ${pane} still exists; settle it before retiring the plan`);
+    }
+    if (dirty(plan.worktree_path))
+      throw new Error('Working tree is not clean; preserve and inspect changes before retiring');
+
+    return db.transaction(() => {
+      const current = db.query('SELECT * FROM plans WHERE id=?').get(id) as any;
+      if (retired(current)) throw new Error('Plan is already retired');
+      if (decision.plan_fingerprint !== planFingerprint(db, id) ||
+        shape(decision.retire_runs) !== shape(linkedRuns(db, current).filter(r => !terminalStageList.includes(r.stage))))
+        throw new Error('Retirement evidence is stale');
+      if (dirty(current.worktree_path) || git(current.worktree_path, 'rev-parse', 'HEAD') !== decision.head_sha)
+        throw new Error('Git state changed during retirement');
+      const now = new Date().toISOString();
+      const record = join(path, `retirement-${randomUUID()}.json`);
+      writeFileSync(record, JSON.stringify({ ...decision, controller, retired_at: now,
+        retired_runs: unfinished.map(run => ({ run_id: run.id, kind: run.kind ?? 'task', stage: run.stage })),
+        closed_panes: panes }, null, 2), { flag: 'wx' });
+      for (const run of unfinished)
+        db.query('UPDATE runs SET retired_at=?,retired_reason=? WHERE id=? AND retired_at IS NULL')
+          .run(now, decision.reason, run.id);
+      if (ids.length)
+        db.query(`UPDATE attempts SET cleanup_state='closed',cleanup_error=?
+          WHERE pane_id IS NOT NULL AND COALESCE(cleanup_state,'')!='closed'
+          AND run_id IN (${ids.map(() => '?').join(',')})`)
+          .run(`Pane absent at plan retirement ${now}`, ...ids);
+      db.query('UPDATE plans SET retired_at=?,retired_reason=? WHERE id=? AND retired_at IS NULL')
+        .run(now, decision.reason, id);
+      return { plan: path, retired_at: now, record, worktree: 'released',
+        retired_runs: unfinished.map(run => ({ run_id: run.id, stage: run.stage })), closed_panes: panes };
     }).immediate();
   } finally { db.close(); }
 }
@@ -543,9 +673,11 @@ export function preparePlanFinalReview(planPath: string, controller: string) {
   const db = new Database(database);
   db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
   try {
+    retirementSchema(db);
     return db.transaction(() => {
       const plan = db.query('SELECT * FROM plans WHERE id=?').get(id) as any;
       if (!plan || dirname(plan.input_path) !== path) throw new Error('Plan not found');
+      if (retired(plan)) throw new Error('Plan is retired; register a new plan instead of reusing it');
       if (plan.controller_id !== controller) throw new Error('Plan controller mismatch');
       if (plan.final_run_id) {
         const run = db.query('SELECT * FROM runs WHERE id=?').get(plan.final_run_id) as any;
@@ -596,9 +728,11 @@ export function prepareNextRun(planPath: string, controller: string, taskKey: st
   const db = new Database(database);
   db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
   try {
+    retirementSchema(db);
     return db.transaction(() => {
       const plan = db.query('SELECT * FROM plans WHERE id=?').get(id) as any;
       if (!plan || dirname(plan.input_path) !== path) throw new Error('Plan not found');
+      if (retired(plan)) throw new Error('Plan is retired; register a new plan instead of reusing it');
       if (plan.controller_id !== controller) throw new Error('Plan controller mismatch');
       const tasks = db.query('SELECT * FROM plan_tasks WHERE plan_id=? ORDER BY position').all(id) as any[];
       const target = tasks.find(t => t.task_key === taskKey);
@@ -675,7 +809,9 @@ export function status(runPath: string) {
       task_passed: 'task complete; final review requires a separate approved registration',
       dispatching: 'reconcile dispatch before further action' };
     return { run, attempts, observed_head: head, worktree_fingerprint: worktreeFingerprint(run.worktree_path), discrepancies, cleanup,
-      next_action: discrepancies.length || run.blocked_reason ? 'resolve_discrepancies' :
+      // A retired run stays readable for inspection; it is simply never actionable again.
+      next_action: retired(run) ? 'run_retired; abandoned with the plan and closed to further commands'
+        : discrepancies.length || run.blocked_reason ? 'resolve_discrepancies' :
         cleanup.pending.length ? 'cleanup-workers' : next[run.stage],
       worker_observation: 'Not polled by status; accept-implementation checks live identity and readiness' };
   } finally { db.close(); }
@@ -926,9 +1062,11 @@ function openRun(runPath: string, kind: 'task' | 'final_review' | 'either' = 'ta
   const db = new Database(join(dirname(path), 'workflow.sqlite'), { readwrite: true });
   db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000');
   cleanupSchema(db);
+  retirementSchema(db);
   const id = path.slice(path.lastIndexOf('/') + 1);
   const run = db.query('SELECT * FROM runs WHERE id = ?').get(id) as any;
   if (!run) { db.close(); throw new Error('Run not found'); }
+  if (retired(run)) { db.close(); throw new Error('Run is retired; it cannot be dispatched, accepted, repaired or resumed'); }
   if (kind !== 'either' && (run.kind ?? 'task') !== kind) { db.close(); throw new Error('Wrong run kind; task commands cannot operate on final runs or vice versa'); }
   return { path, db, run };
 }
@@ -2423,6 +2561,8 @@ if (import.meta.main) {
       console.log(JSON.stringify(preparePlanFinalReview(path, controller), null, 2));
     else if (command === 'take-over-plan' && path && flag === '--controller' && controller && extra.length === 2 && extra[0] === '--decision')
       console.log(JSON.stringify(await takeOverPlan(path, controller, extra[1]), null, 2));
+    else if (command === 'retire-plan' && path && flag === '--controller' && controller && extra.length === 2 && extra[0] === '--decision')
+      console.log(JSON.stringify(await retirePlan(path, controller, extra[1]), null, 2));
     else if (command === 'prepare-next-run' && path && flag === '--controller' && controller &&
       extra.length === 4 && extra[0] === '--task' && extra[2] === '--input')
       console.log(JSON.stringify(prepareNextRun(path, controller, extra[1], extra[3]), null, 2));
@@ -2470,7 +2610,7 @@ if (import.meta.main) {
       console.log(JSON.stringify(await cleanupWorkers(path, controller), null, 2));
     else if (command === 'dispatch-repair' && path && flag === '--controller' && controller && !extra.length)
       console.log(JSON.stringify(await dispatchRepair(path, controller), null, 2));
-    else throw new Error('Usage: register-plan <plan.json> --controller <id> | plan-status <plan-path> | prepare-next-run <plan> --controller <id> --task <key> --input <task.json> | register-task <task.json> --controller <id> | status <run-path> | dispatch-implementation <run> --controller <id> --pane <id> --tab <id> | accept-implementation <run> --controller <id>');
+    else throw new Error('Usage: register-plan <plan.json> --controller <id> | plan-status <plan-path> | retire-plan <plan-path> --controller <id> --decision <json> | prepare-next-run <plan> --controller <id> --task <key> --input <task.json> | register-task <task.json> --controller <id> | status <run-path> | dispatch-implementation <run> --controller <id> --pane <id> --tab <id> | accept-implementation <run> --controller <id>');
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

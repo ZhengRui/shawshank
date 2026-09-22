@@ -46,6 +46,12 @@ Final-run takeover is not supported. The same owner may replace an interrupted
 final worker before report delivery using recovery's stop-evidence rules.
 The same owner can release a positively confirmed no-launch attempt in task or
 final dispatch via recovery's `resolve-no-launch`; this never launches or prompts.
+When no supported transition remains at all — for example an interrupted final
+run whose snapshotted role is unobtainable and may not be substituted — the plan
+is retired with user authorization via `retire-plan`; see
+[plan-registration.md](references/plan-registration.md#retire-an-unreachable-plan).
+Retirement abandons the plan and releases its worktree; it never accepts,
+advances or rewrites the work, and it is never a substitute for recovery.
 
 Before dispatch, establish the approved scope, repository, local commit authority
 and allowed Herdr parent pane/tab. Inspect Git state and preserve unrelated work.

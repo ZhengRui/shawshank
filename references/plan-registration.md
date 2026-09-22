@@ -15,6 +15,7 @@ Commands, via `bun <skill>/scripts/workflow.ts`:
 - `prepare-plan-final-review <plan-path> --controller <id>`
 - `take-over-plan <plan-path> --controller <new-id> --decision <json>`
 - `amend-plan-scope <plan-path> --controller <id> --decision <json>` (omitted files only)
+- `retire-plan <plan-path> --controller <id> --decision <json>`
 
 Input example:
 
@@ -185,6 +186,39 @@ the current plan input alongside baseline/adjustments after recovery. Subsequent
 dispatches must explain the correction to retained workers; earlier briefs and
 reports remain historical. Failed transactions may retain unlinked artifacts,
 not effective changes.
+
+## Retire an unreachable plan
+
+A plan reserves its worktree until `final_passed` with completed cleanup. When no
+supported transition can still reach that state, `retire-plan` abandons the plan
+and releases the reservation so other work can register. The common cause is an
+interrupted final run whose snapshotted reviewer/verifier role is unobtainable:
+final replacement must preserve that exact kind and model, final-run takeover is
+unsupported, and a different controller may not take over a plan once its final
+run exists. Retirement is the documented end of that road, not a way around a
+boundary that is still passable. If the plan can be resumed by its owner or taken
+over between tasks, do that instead.
+
+Retirement is additive. Stages, reports, triage decisions, counters, commits,
+task links and snapshots are left exactly as delivered; a `retired_at` marker is
+added to the plan and to its unfinished runs. `plan-status` then reports
+`plan_retired` and `status` reports `run_retired`. Both stay readable for
+inspection forever; both refuse every command that would dispatch, accept, repair
+or resume them. Retiring never deletes evidence and never closes a live worker.
+
+Requires user authorization, a clean working tree, and a decision file with
+`plan_id`, `plan_fingerprint` (current plan-status `recovery_fingerprint`),
+`head_sha`, `unreachable: true`, `reason`, `authorization`, and `retire_runs`
+listing `{run_id, stage}` for every unfinished linked run — task runs and the
+final run alike. That enumeration must match the live ledger exactly, by id and
+current stage, so an unfinished run cannot be retired without being named. Every
+tracked worker pane is checked through Herdr first: a pane that still exists
+aborts the command, and only panes Herdr reports absent have their cleanup
+closed. The command writes a write-once `retirement-<uuid>.json` beside the plan
+snapshot recording the decision, the retired runs and the closed panes.
+
+Retirement records judgment, not proof. Setting `unreachable` does not make a
+plan unreachable; establish that first and cite it in `reason`.
 
 ## Resume and controller handoff
 
